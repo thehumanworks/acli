@@ -4,7 +4,7 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
 
 ## What it does
 
-- Accepts the spec from `OPENAPI_CLI_SPEC` or `--spec`
+- Accepts the spec from `ACLI_SPEC` or `--spec`
   - `https://...` URL
   - local file path
   - raw inline JSON string
@@ -18,24 +18,25 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
   - apiKey in header/query/cookie
   - oauth2/openIdConnect token passthrough
 - Supports shell completions
-- Renders an optional ASCII-art banner from `OPENAPI_CLI_TITLE`
-- Applies an optional color theme from `OPENAPI_CLI_COLOR_SCHEME`
+- Renders an optional ASCII-art banner from `ACLI_TITLE`
+- Applies an optional color theme from `ACLI_COLOR_SCHEME`
 
 ## Environment variables
 
-- `OPENAPI_CLI_SPEC` — required unless `--spec` is passed
-- `OPENAPI_CLI_TITLE` — optional ASCII banner title
-- `OPENAPI_CLI_COLOR_SCHEME` — optional preset (`default|mono|ocean|sunset`) or JSON object
-- `OPENAPI_CLI_COLOR` — `auto|always|never`
-- `OPENAPI_CLI_BASE_URL` — override the spec server URL
-- `OPENAPI_CLI_SERVER_VARS` — JSON object for server template variables
-- `OPENAPI_CLI_BEARER_TOKEN`
-- `OPENAPI_CLI_BASIC_USER`
-- `OPENAPI_CLI_BASIC_PASS`
-- `OPENAPI_CLI_API_KEY`
-- `OPENAPI_CLI_TIMEOUT_SECS`
-- `OPENAPI_CLI_INSECURE`
-- `OPENAPI_CLI_AUTH_<SCHEME_NAME>` — named auth override, where non-alphanumeric characters are converted to `_` and the name is uppercased
+- `ACLI_SPEC` — required unless `--spec` is passed
+- `ACLI_TITLE` — optional ASCII banner title
+- `ACLI_COLOR_SCHEME` — optional preset (`default|mono|ocean|sunset`) or JSON object
+- `ACLI_COLOR` — `auto|always|never`
+- `ACLI_BASE_URL` — override the spec server URL
+- `ACLI_SERVER_VARS` — JSON object for server template variables
+- `ACLI_DEFAULT_HEADERS` — JSON object of headers to send with every API request; these can satisfy required header parameters generated from the spec
+- `ACLI_BEARER_TOKEN`
+- `ACLI_BASIC_USER`
+- `ACLI_BASIC_PASS`
+- `ACLI_API_KEY`
+- `ACLI_TIMEOUT_SECS`
+- `ACLI_INSECURE`
+- `ACLI_AUTH_<SCHEME_NAME>` — named auth override, where non-alphanumeric characters are converted to `_` and the name is uppercased
 
 ## Example theme JSON
 
@@ -54,9 +55,10 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
 ## Example usage
 
 ```bash
-export OPENAPI_CLI_SPEC='https://petstore3.swagger.io/api/v3/openapi.json'
-export OPENAPI_CLI_TITLE='Petstore'
-export OPENAPI_CLI_COLOR_SCHEME='ocean'
+export ACLI_SPEC='https://petstore3.swagger.io/api/v3/openapi.json'
+export ACLI_TITLE='Petstore'
+export ACLI_COLOR_SCHEME='ocean'
+export ACLI_DEFAULT_HEADERS='{"X-API-Key":"secret"}'
 
 cargo run -- list
 cargo run -- describe get-pet-by-id

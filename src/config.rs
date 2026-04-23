@@ -1,18 +1,20 @@
 use crate::colors::ColorMode;
 use anyhow::{anyhow, Result};
 
-pub const ENV_SPEC: &str = "OPENAPI_CLI_SPEC";
-pub const ENV_TITLE: &str = "OPENAPI_CLI_TITLE";
-pub const ENV_COLOR_SCHEME: &str = "OPENAPI_CLI_COLOR_SCHEME";
-pub const ENV_COLOR: &str = "OPENAPI_CLI_COLOR";
-pub const ENV_BASE_URL: &str = "OPENAPI_CLI_BASE_URL";
-pub const ENV_SERVER_VARS: &str = "OPENAPI_CLI_SERVER_VARS";
-pub const ENV_BEARER_TOKEN: &str = "OPENAPI_CLI_BEARER_TOKEN";
-pub const ENV_BASIC_USER: &str = "OPENAPI_CLI_BASIC_USER";
-pub const ENV_BASIC_PASS: &str = "OPENAPI_CLI_BASIC_PASS";
-pub const ENV_API_KEY: &str = "OPENAPI_CLI_API_KEY";
-pub const ENV_TIMEOUT: &str = "OPENAPI_CLI_TIMEOUT_SECS";
-pub const ENV_INSECURE: &str = "OPENAPI_CLI_INSECURE";
+pub const ENV_SPEC: &str = "ACLI_SPEC";
+pub const ENV_TITLE: &str = "ACLI_TITLE";
+pub const ENV_COLOR_SCHEME: &str = "ACLI_COLOR_SCHEME";
+pub const ENV_COLOR: &str = "ACLI_COLOR";
+pub const ENV_BASE_URL: &str = "ACLI_BASE_URL";
+pub const ENV_SERVER_VARS: &str = "ACLI_SERVER_VARS";
+pub const ENV_DEFAULT_HEADERS: &str = "ACLI_DEFAULT_HEADERS";
+pub const ENV_BEARER_TOKEN: &str = "ACLI_BEARER_TOKEN";
+pub const ENV_BASIC_USER: &str = "ACLI_BASIC_USER";
+pub const ENV_BASIC_PASS: &str = "ACLI_BASIC_PASS";
+pub const ENV_API_KEY: &str = "ACLI_API_KEY";
+pub const ENV_AUTH_PREFIX: &str = "ACLI_AUTH_";
+pub const ENV_TIMEOUT: &str = "ACLI_TIMEOUT_SECS";
+pub const ENV_INSECURE: &str = "ACLI_INSECURE";
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
@@ -128,6 +130,7 @@ Environment:
   {ENV_COLOR}          Optional color mode (auto|always|never).
   {ENV_BASE_URL}       Optional base URL override when the spec has no usable server.
   {ENV_SERVER_VARS}    Optional JSON object for server template variable overrides.
+  {ENV_DEFAULT_HEADERS} Optional JSON object of headers to send with every request.
   {ENV_BEARER_TOKEN}   Default bearer token.
   {ENV_BASIC_USER}     Default HTTP basic username.
   {ENV_BASIC_PASS}     Default HTTP basic password.

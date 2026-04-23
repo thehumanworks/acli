@@ -1,7 +1,8 @@
 use crate::colors::Theme;
 use crate::config::{
     ENV_API_KEY, ENV_BASE_URL, ENV_BASIC_PASS, ENV_BASIC_USER, ENV_BEARER_TOKEN, ENV_COLOR,
-    ENV_COLOR_SCHEME, ENV_INSECURE, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT, ENV_TITLE,
+    ENV_COLOR_SCHEME, ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT,
+    ENV_TITLE,
 };
 use crate::spec::{OpenApiSpec, OperationSpec, ParameterSpec, SecurityRequirement};
 use clap::builder::PossibleValuesParser;
@@ -352,7 +353,7 @@ fn parameter_arg(parameter: &ParameterSpec) -> Arg {
     Arg::new(parameter.arg_id.clone())
         .long(parameter.flag_name.clone())
         .value_name(value_name)
-        .required(parameter.required)
+        .required(parameter.required && parameter.location != "header")
         .help(help)
 }
 
@@ -561,7 +562,7 @@ fn long_about(spec: &OpenApiSpec) -> String {
 
 fn root_after_help(bin_name: &str) -> String {
     format!(
-        "Environment:\n  {ENV_SPEC}           OpenAPI spec source (URL, path, or inline JSON)\n  {ENV_TITLE}          Optional ASCII banner title\n  {ENV_COLOR_SCHEME}   Color preset or JSON theme config\n  {ENV_COLOR}          auto|always|never\n  {ENV_BASE_URL}       Server URL override\n  {ENV_SERVER_VARS}    JSON object for server variable overrides\n  {ENV_BEARER_TOKEN}   Default bearer token\n  {ENV_BASIC_USER}     Default basic auth username\n  {ENV_BASIC_PASS}     Default basic auth password\n  {ENV_API_KEY}        Default api key fallback\n\nCommon workflow:\n  {bin_name} list\n  {bin_name} describe <operation>\n  {bin_name} <operation> [generated flags] [--query name=value] [--body-file payload.json]"
+        "Environment:\n  {ENV_SPEC}              OpenAPI spec source (URL, path, or inline JSON)\n  {ENV_TITLE}             Optional ASCII banner title\n  {ENV_COLOR_SCHEME}      Color preset or JSON theme config\n  {ENV_COLOR}             auto|always|never\n  {ENV_BASE_URL}          Server URL override\n  {ENV_SERVER_VARS}       JSON object for server variable overrides\n  {ENV_DEFAULT_HEADERS}  JSON object of headers sent with every request\n  {ENV_BEARER_TOKEN}      Default bearer token\n  {ENV_BASIC_USER}        Default basic auth username\n  {ENV_BASIC_PASS}        Default basic auth password\n  {ENV_API_KEY}           Default api key fallback\n\nCommon workflow:\n  {bin_name} list\n  {bin_name} describe <operation>\n  {bin_name} <operation> [generated flags] [--query name=value] [--body-file payload.json]"
     )
 }
 
@@ -569,4 +570,48 @@ fn is_alias_safe(value: &str) -> bool {
     value
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    fn required_parameter(location: &str) -> ParameterSpec {
+        ParameterSpec {
+            name: "API-Key".to_string(),
+            location: location.to_string(),
+            flag_name: format!("{location}-api-key"),
+            arg_id: format!("param__{location}__api_key"),
+            required: true,
+            deprecated: false,
+            description: None,
+            style: None,
+            explode: None,
+            schema: None,
+            content_types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn required_header_parameters_are_not_clap_required() {
+        let parameter = required_parameter("header");
+        let command = Command::new("operation").arg(parameter_arg(&parameter));
+        let matches = command.try_get_matches_from(["operation"]).unwrap();
+
+        assert!(matches
+            .get_one::<String>("param__header__api_key")
+            .is_none());
+    }
+
+    #[test]
+    fn required_query_parameters_are_still_clap_required() {
+        let parameter = required_parameter("query");
+        let error = Command::new("operation")
+            .arg(parameter_arg(&parameter))
+            .try_get_matches_from(["operation"])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
 }

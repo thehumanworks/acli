@@ -1,5 +1,7 @@
 use crate::colors::Theme;
-use crate::config::{ENV_INSECURE, ENV_SERVER_VARS};
+use crate::config::{
+    ENV_AUTH_PREFIX, ENV_BASE_URL, ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_SERVER_VARS,
+};
 use crate::spec::{
     OpenApiSpec, OperationSpec, SecurityRequirement, SecuritySchemeSpec, ServerSpec,
 };
@@ -371,6 +373,7 @@ struct RuntimeOptions {
     server_url: Option<String>,
     server_index: usize,
     server_vars: BTreeMap<String, String>,
+    default_headers: BTreeMap<String, String>,
     bearer_token: Option<String>,
     basic_user: Option<String>,
     basic_pass: Option<String>,
@@ -385,11 +388,17 @@ struct RuntimeOptions {
 
 impl RuntimeOptions {
     fn from_matches(matches: &ArgMatches) -> Result<Self> {
-        let mut server_vars =
-            parse_json_string_map(std::env::var(ENV_SERVER_VARS).ok().as_deref())?;
+        let mut server_vars = parse_json_string_map(
+            std::env::var(ENV_SERVER_VARS).ok().as_deref(),
+            ENV_SERVER_VARS,
+        )?;
         for (key, value) in parse_pairs(matches.get_many::<String>("server_var"))? {
             server_vars.insert(key, value);
         }
+        let default_headers = parse_json_string_map(
+            std::env::var(ENV_DEFAULT_HEADERS).ok().as_deref(),
+            ENV_DEFAULT_HEADERS,
+        )?;
 
         let mut auth_overrides = BTreeMap::new();
         for (key, value) in parse_pairs(matches.get_many::<String>("auth"))? {
@@ -402,6 +411,7 @@ impl RuntimeOptions {
             server_url: matches.get_one::<String>("server_url").cloned(),
             server_index: *matches.get_one::<usize>("server_index").unwrap_or(&0),
             server_vars,
+            default_headers,
             bearer_token: matches.get_one::<String>("bearer_token").cloned(),
             basic_user: matches.get_one::<String>("basic_user").cloned(),
             basic_pass: matches.get_one::<String>("basic_pass").cloned(),
@@ -522,7 +532,7 @@ struct RequestPlan {
 fn build_request_plan(
     operation: &OperationSpec,
     server_url: &str,
-    _runtime: &RuntimeOptions,
+    runtime: &RuntimeOptions,
     invocation: &InvocationInput,
     auth: &ResolvedAuth,
 ) -> Result<RequestPlan> {
@@ -531,13 +541,21 @@ fn build_request_plan(
 
     let url = build_url(operation, server_url, &invocation.path_values, &query_pairs)?;
     let mut headers = HeaderMap::new();
+    let mut default_header_names = Vec::new();
 
-    for (name, value) in &invocation.header_values {
-        append_header(&mut headers, name, value)?;
+    for (name, value) in &runtime.default_headers {
+        default_header_names.push(insert_header(&mut headers, name, value)?);
     }
-    for (name, value) in &auth.header_pairs {
-        append_header(&mut headers, name, value)?;
-    }
+    append_header_pairs_replacing_defaults(
+        &mut headers,
+        &invocation.header_values,
+        &mut default_header_names,
+    )?;
+    append_header_pairs_replacing_defaults(
+        &mut headers,
+        &auth.header_pairs,
+        &mut default_header_names,
+    )?;
     if let Some(accept) = &invocation.accept {
         headers.insert(ACCEPT, HeaderValue::from_str(accept)?);
     }
@@ -579,6 +597,8 @@ fn build_request_plan(
             HeaderValue::from_str(&value)?,
         );
     }
+
+    validate_required_headers(operation, &headers)?;
 
     Ok(RequestPlan {
         method: Method::from_bytes(operation.method.as_bytes())?,
@@ -680,7 +700,7 @@ fn resolve_server_url(
 
     if operation.servers.is_empty() {
         bail!(
-            "operation '{}' does not declare any servers; pass --server-url or set OPENAPI_CLI_BASE_URL",
+            "operation '{}' does not declare any servers; pass --server-url or set {ENV_BASE_URL}",
             operation.slug
         );
     }
@@ -700,7 +720,7 @@ fn resolve_server_url(
 fn absolutize_server_url(candidate: &str, base: Option<&Url>) -> Result<String> {
     let trimmed = candidate.trim();
     if trimmed.is_empty() {
-        bail!("server URL is empty; pass --server-url or set OPENAPI_CLI_BASE_URL");
+        bail!("server URL is empty; pass --server-url or set {ENV_BASE_URL}");
     }
 
     if Url::parse(trimmed).is_ok() {
@@ -710,7 +730,7 @@ fn absolutize_server_url(candidate: &str, base: Option<&Url>) -> Result<String> 
     let base = base.ok_or_else(|| {
         anyhow!(
             "server URL '{trimmed}' is relative but the spec was not loaded from an HTTP(S) URL; \
-             pass --server-url or set OPENAPI_CLI_BASE_URL to an absolute URL"
+             pass --server-url or set {ENV_BASE_URL} to an absolute URL"
         )
     })?;
 
@@ -971,16 +991,16 @@ where
     Ok(pairs)
 }
 
-fn parse_json_string_map(input: Option<&str>) -> Result<BTreeMap<String, String>> {
+fn parse_json_string_map(input: Option<&str>, env_name: &str) -> Result<BTreeMap<String, String>> {
     let Some(input) = input.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(BTreeMap::new());
     };
 
     let value: Value = serde_json::from_str(input)
-        .with_context(|| format!("failed to parse {ENV_SERVER_VARS} as a JSON object"))?;
+        .with_context(|| format!("failed to parse {env_name} as a JSON object"))?;
     let object = value
         .as_object()
-        .ok_or_else(|| anyhow!("{ENV_SERVER_VARS} must be a JSON object"))?;
+        .ok_or_else(|| anyhow!("{env_name} must be a JSON object"))?;
     let mut out = BTreeMap::new();
     for (key, value) in object {
         out.insert(key.clone(), value_to_string(value));
@@ -988,10 +1008,62 @@ fn parse_json_string_map(input: Option<&str>) -> Result<BTreeMap<String, String>
     Ok(out)
 }
 
-fn append_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<()> {
-    let header_name = HeaderName::from_bytes(name.as_bytes())?;
-    let header_value = HeaderValue::from_str(value)?;
-    headers.append(header_name, header_value);
+fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<HeaderName> {
+    let header_name = parse_header_name(name)?;
+    let header_value = parse_header_value(name, value)?;
+    headers.insert(header_name.clone(), header_value);
+    Ok(header_name)
+}
+
+fn append_header_pairs_replacing_defaults(
+    headers: &mut HeaderMap,
+    pairs: &[(String, String)],
+    default_header_names: &mut Vec<HeaderName>,
+) -> Result<()> {
+    let mut replaced_names = Vec::new();
+    for (name, value) in pairs {
+        let header_name = parse_header_name(name)?;
+        if !replaced_names.contains(&header_name) {
+            if let Some(index) = default_header_names
+                .iter()
+                .position(|default_name| default_name == header_name)
+            {
+                headers.remove(&header_name);
+                default_header_names.remove(index);
+            }
+            replaced_names.push(header_name.clone());
+        }
+        let header_value = parse_header_value(name, value)?;
+        headers.append(header_name, header_value);
+    }
+    Ok(())
+}
+
+fn parse_header_name(name: &str) -> Result<HeaderName> {
+    HeaderName::from_bytes(name.as_bytes())
+        .with_context(|| format!("invalid request header name '{name}'"))
+}
+
+fn parse_header_value(name: &str, value: &str) -> Result<HeaderValue> {
+    HeaderValue::from_str(value)
+        .with_context(|| format!("invalid value for request header '{name}'"))
+}
+
+fn validate_required_headers(operation: &OperationSpec, headers: &HeaderMap) -> Result<()> {
+    for parameter in &operation.parameters {
+        if parameter.location != "header" || !parameter.required {
+            continue;
+        }
+        let header_name = parse_header_name(&parameter.name)?;
+        if !headers.contains_key(&header_name) {
+            bail!(
+                "missing required header parameter '{}' for operation '{}'",
+                parameter.name,
+                operation.slug
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1018,7 +1090,7 @@ fn env_truthy(name: &str) -> bool {
 }
 
 fn env_auth_override(scheme_name: &str) -> Option<String> {
-    let key = format!("OPENAPI_CLI_AUTH_{}", sanitize_env_key(scheme_name));
+    let key = format!("{ENV_AUTH_PREFIX}{}", sanitize_env_key(scheme_name));
     std::env::var(key).ok()
 }
 
@@ -1070,4 +1142,306 @@ fn base64_encode(input: String) -> String {
         index += 3;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::ParameterSpec;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: String,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self {
+                name: name.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(&self.name, value),
+                    None => std::env::remove_var(&self.name),
+                }
+            }
+        }
+    }
+
+    fn minimal_operation() -> OperationSpec {
+        OperationSpec {
+            slug: "list-widgets".to_string(),
+            operation_id: Some("listWidgets".to_string()),
+            method: "GET".to_string(),
+            path: "/widgets".to_string(),
+            summary: None,
+            description: None,
+            tags: Vec::new(),
+            deprecated: false,
+            parameters: Vec::new(),
+            request_body: None,
+            responses: Vec::new(),
+            servers: Vec::new(),
+            security: None,
+        }
+    }
+
+    fn minimal_runtime() -> RuntimeOptions {
+        RuntimeOptions {
+            server_url: None,
+            server_index: 0,
+            server_vars: BTreeMap::new(),
+            bearer_token: None,
+            basic_user: None,
+            basic_pass: None,
+            api_key: None,
+            auth_overrides: BTreeMap::new(),
+            default_headers: BTreeMap::new(),
+            timeout_secs: 30,
+            insecure: false,
+            verbose: false,
+            raw_output: false,
+            output: None,
+        }
+    }
+
+    fn minimal_invocation() -> InvocationInput {
+        InvocationInput {
+            path_values: BTreeMap::new(),
+            query_values: Vec::new(),
+            header_values: Vec::new(),
+            cookie_values: Vec::new(),
+            body: BodyInput::None,
+            content_type: None,
+            accept: None,
+            dry_run: false,
+        }
+    }
+
+    fn required_header_parameter(name: &str) -> ParameterSpec {
+        ParameterSpec {
+            name: name.to_string(),
+            location: "header".to_string(),
+            flag_name: format!("header-{}", name.to_ascii_lowercase()),
+            arg_id: format!("param__header__{}", name.to_ascii_lowercase()),
+            required: true,
+            deprecated: false,
+            description: None,
+            style: None,
+            explode: None,
+            schema: None,
+            content_types: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn forwards_default_headers_to_request_plan() {
+        let operation = minimal_operation();
+        let mut runtime = minimal_runtime();
+        runtime
+            .default_headers
+            .insert("X-API-Key".to_string(), "secret".to_string());
+        let invocation = minimal_invocation();
+        let auth = ResolvedAuth::default();
+
+        let plan = build_request_plan(
+            &operation,
+            "https://api.example.com",
+            &runtime,
+            &invocation,
+            &auth,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    fn explicit_headers_replace_matching_default_headers() {
+        let operation = minimal_operation();
+        let mut runtime = minimal_runtime();
+        runtime
+            .default_headers
+            .insert("X-API-Key".to_string(), "default".to_string());
+        let mut invocation = minimal_invocation();
+        invocation
+            .header_values
+            .push(("X-API-Key".to_string(), "explicit".to_string()));
+        let auth = ResolvedAuth::default();
+
+        let plan = build_request_plan(
+            &operation,
+            "https://api.example.com",
+            &runtime,
+            &invocation,
+            &auth,
+        )
+        .unwrap();
+        let values = plan
+            .headers
+            .get_all("x-api-key")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec!["explicit"]);
+    }
+
+    #[test]
+    fn auth_headers_replace_matching_default_headers() {
+        let operation = minimal_operation();
+        let mut runtime = minimal_runtime();
+        runtime
+            .default_headers
+            .insert("X-API-Key".to_string(), "default".to_string());
+        let invocation = minimal_invocation();
+        let mut auth = ResolvedAuth::default();
+        auth.header_pairs
+            .push(("X-API-Key".to_string(), "auth".to_string()));
+
+        let plan = build_request_plan(
+            &operation,
+            "https://api.example.com",
+            &runtime,
+            &invocation,
+            &auth,
+        )
+        .unwrap();
+        let values = plan
+            .headers
+            .get_all("x-api-key")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec!["auth"]);
+    }
+
+    #[test]
+    fn auth_headers_preserve_non_default_explicit_headers() {
+        let operation = minimal_operation();
+        let runtime = minimal_runtime();
+        let mut invocation = minimal_invocation();
+        invocation
+            .header_values
+            .push(("X-API-Key".to_string(), "explicit".to_string()));
+        let mut auth = ResolvedAuth::default();
+        auth.header_pairs
+            .push(("X-API-Key".to_string(), "auth".to_string()));
+
+        let plan = build_request_plan(
+            &operation,
+            "https://api.example.com",
+            &runtime,
+            &invocation,
+            &auth,
+        )
+        .unwrap();
+        let values = plan
+            .headers
+            .get_all("x-api-key")
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, vec!["explicit", "auth"]);
+    }
+
+    #[test]
+    fn required_header_parameter_is_satisfied_by_default_header() {
+        let mut operation = minimal_operation();
+        operation
+            .parameters
+            .push(required_header_parameter("API-Key"));
+        let mut runtime = minimal_runtime();
+        runtime
+            .default_headers
+            .insert("API-Key".to_string(), "secret".to_string());
+        let invocation = minimal_invocation();
+        let auth = ResolvedAuth::default();
+
+        let plan = build_request_plan(
+            &operation,
+            "https://api.example.com",
+            &runtime,
+            &invocation,
+            &auth,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.headers
+                .get("api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    fn missing_required_header_parameter_is_rejected_at_runtime() {
+        let mut operation = minimal_operation();
+        operation
+            .parameters
+            .push(required_header_parameter("API-Key"));
+        let runtime = minimal_runtime();
+        let invocation = minimal_invocation();
+        let auth = ResolvedAuth::default();
+
+        let error = build_request_plan(
+            &operation,
+            "https://api.example.com",
+            &runtime,
+            &invocation,
+            &auth,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("API-Key"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn parses_json_string_map_errors_with_requested_env_name() {
+        let error = parse_json_string_map(Some("[]"), "ACLI_DEFAULT_HEADERS").unwrap_err();
+
+        assert!(
+            error.to_string().contains("ACLI_DEFAULT_HEADERS"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn named_auth_override_uses_acli_prefix() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _new_prefix = EnvVarGuard::set("ACLI_AUTH_CUSTOM_HEADER", Some("secret"));
+
+        assert_eq!(
+            env_auth_override("custom-header").as_deref(),
+            Some("secret")
+        );
+    }
 }

@@ -89,8 +89,8 @@ impl Theme {
             .filter(|value| !value.is_empty())
         {
             if raw.starts_with('{') {
-                let overrides: ThemeOverrides = serde_json::from_str(raw)
-                    .context("failed to parse OPENAPI_CLI_COLOR_SCHEME JSON")?;
+                let overrides: ThemeOverrides =
+                    serde_json::from_str(raw).context("failed to parse ACLI_COLOR_SCHEME JSON")?;
                 apply_overrides(&mut theme, overrides)?;
             } else {
                 let preset_name = raw.to_ascii_lowercase();

@@ -6,7 +6,7 @@ mod spec;
 
 use crate::cli::build_command;
 use crate::colors::Theme;
-use crate::config::{bootstrap_help, BootstrapConfig};
+use crate::config::{bootstrap_help, BootstrapConfig, ENV_SPEC};
 use crate::execute::run;
 use crate::spec::{load_spec_text, OpenApiSpec};
 use anyhow::{Context, Result};
@@ -42,7 +42,7 @@ fn real_main() -> Result<()> {
         }
         None => {
             eprintln!("{}", bootstrap_help(&bin_name));
-            anyhow::bail!("missing OpenAPI spec source; set OPENAPI_CLI_SPEC or pass --spec")
+            anyhow::bail!("missing OpenAPI spec source; set {ENV_SPEC} or pass --spec")
         }
     };
 
