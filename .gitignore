@@ -1,0 +1,53 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+
+# Cargo and Rust tooling caches
+/.cargo/.package-cache
+/.cargo/.global-cache
+
+# Pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+
+# Logs and diagnostics
+*.log
+*.trace
+*.profraw
+*.profdata
+
+# Coverage and reports
+/coverage/
+/tarpaulin-report.html
+/lcov.info
+
+# Generated artifacts
+/dist/
+/build/
+/release/
+/tmp/
+/temp/
+
+# Editor and IDE state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local agent/tooling scratch
+/.agents/tmp/
+/.agents/work/

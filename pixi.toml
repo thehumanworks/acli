@@ -1,0 +1,15 @@
+[workspace]
+authors = ["agentmish <rodat.dev@proton.me>"]
+channels = ["conda-forge"]
+name = "acli"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[pypi-options]
+index-url = "https://pypi.org/simple"
+extra-index-urls = ["https://pypi.org/simple2"]
+
+[tasks]
+cli = "cargo run --release --"
+
+[dependencies]
