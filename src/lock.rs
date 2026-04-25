@@ -1,9 +1,10 @@
 //! Pin an OpenAPI JSON document with optional runtime config, store secrets in the OS keychain by default, and emit a small Rust crate that compiles to an API-specific CLI.
 
 use crate::config::{
-    sanitize_env_key, ENV_API_KEY, ENV_AUTH_PREFIX, ENV_BASE_URL, ENV_BASIC_PASS, ENV_BASIC_USER,
-    ENV_BEARER_TOKEN, ENV_COLOR, ENV_COLOR_SCHEME, ENV_DEFAULT_HEADERS, ENV_INSECURE,
-    ENV_NO_BANNER, ENV_SERVER_INDEX, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT, ENV_TITLE,
+    env_truthy, sanitize_env_key, ENV_API_KEY, ENV_AUTH_PREFIX, ENV_BASE_URL, ENV_BASIC_PASS,
+    ENV_BASIC_USER, ENV_BEARER_TOKEN, ENV_COLOR, ENV_COLOR_SCHEME, ENV_DEFAULT_HEADERS,
+    ENV_INSECURE, ENV_NO_BANNER, ENV_SERVER_INDEX, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT,
+    ENV_TITLE,
 };
 use crate::spec::load_spec_text;
 use anyhow::{anyhow, bail, Context, Result};
@@ -61,7 +62,7 @@ pub struct LockCli {
     #[arg(long, env = ENV_COLOR)]
     pub color: Option<String>,
 
-    #[arg(long, action = clap::ArgAction::SetTrue)]
+    #[arg(long, action = clap::ArgAction::SetTrue, env = ENV_NO_BANNER)]
     pub no_banner: bool,
 
     #[arg(long, env = ENV_BASE_URL)]
@@ -285,6 +286,12 @@ pub fn read_manifest(lock_dir: &Path) -> Result<LockManifest> {
 }
 
 pub fn run_lock_command(cli: LockCli) -> Result<()> {
+    run_lock_command_inner(cli)
+}
+
+fn run_lock_command_inner(cli: LockCli) -> Result<()> {
+    let no_banner = cli.no_banner || env_truthy(ENV_NO_BANNER);
+
     let spec_source = cli
         .spec
         .clone()
@@ -339,7 +346,7 @@ pub fn run_lock_command(cli: LockCli) -> Result<()> {
         title: cli.title.clone(),
         color_scheme: cli.color_scheme.clone(),
         color: cli.color.clone(),
-        no_banner: cli.no_banner,
+        no_banner,
         server_url: cli.server_url.clone(),
         server_index: cli.server_index,
         server_vars,
@@ -544,4 +551,172 @@ fn keychain_set(service: &str, account: &str, secret: &str) -> Result<()> {
         .set_password(secret)
         .with_context(|| format!("failed to store secret in keychain for '{account}'"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        name: String,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self {
+                name: name.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(&self.name, value),
+                    None => std::env::remove_var(&self.name),
+                }
+            }
+        }
+    }
+
+    fn minimal_openapi_json() -> String {
+        r#"{"openapi":"3.0.0","info":{"title":"My Service","version":"1"},"paths":{}}"#.to_string()
+    }
+
+    #[test]
+    fn slugify_crate_name_normalizes_title() {
+        assert_eq!(slugify_crate_name("Pet Store API!"), "pet-store-api");
+        assert_eq!(slugify_crate_name("___"), "api-cli");
+    }
+
+    #[test]
+    fn slugify_binary_name_uses_underscores() {
+        assert_eq!(slugify_binary_name("Pet Store"), "pet_store");
+    }
+
+    #[test]
+    fn merge_server_vars_cli_overrides_env_json() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g = EnvVarGuard::set(ENV_SERVER_VARS, Some(r#"{"a":"env"}"#));
+        let _g2 = EnvVarGuard::set(ENV_DEFAULT_HEADERS, None);
+        let cli = LockCli::try_parse_from(["testprog", "--server-var", "a=cli"]).expect("parse");
+        let map = merge_server_vars(&cli).expect("merge");
+        assert_eq!(map.get("a").map(String::as_str), Some("cli"));
+    }
+
+    #[test]
+    fn merge_default_headers_merges_env_and_cli() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g0 = EnvVarGuard::set(ENV_SERVER_VARS, None);
+        let _g = EnvVarGuard::set(ENV_DEFAULT_HEADERS, Some(r#"{"X":"1"}"#));
+        let cli = LockCli::try_parse_from(["testprog", "--default-header", "Y=2"]).expect("parse");
+        let map = merge_default_headers(&cli).expect("merge");
+        assert_eq!(map.get("X").map(String::as_str), Some("1"));
+        assert_eq!(map.get("Y").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn read_manifest_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_rel = "openapi.json";
+        fs::write(dir.path().join(spec_rel), minimal_openapi_json()).unwrap();
+        let manifest = LockManifest {
+            version: 1,
+            spec_path: spec_rel.to_string(),
+            title: Some("T".into()),
+            color_scheme: None,
+            color: None,
+            no_banner: true,
+            server_url: Some("https://example.test".into()),
+            server_index: 2,
+            server_vars: BTreeMap::from([("host".into(), "api".into())]),
+            default_headers: BTreeMap::from([("X-Foo".into(), "bar".into())]),
+            timeout_secs: 99,
+            insecure: true,
+            keychain_service: None,
+            keychain_auth_accounts: vec![],
+            inline_secrets: InlineSecrets::default(),
+        };
+        fs::write(
+            dir.path().join(MANIFEST_FILE),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = read_manifest(dir.path()).expect("read");
+        assert_eq!(loaded.title.as_deref(), Some("T"));
+        assert_eq!(loaded.server_index, 2);
+        assert_eq!(
+            loaded.server_vars.get("host").map(String::as_str),
+            Some("api")
+        );
+    }
+
+    #[test]
+    fn apply_to_env_sets_expected_vars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g_spec = EnvVarGuard::set(ENV_SPEC, None);
+        let _g_title = EnvVarGuard::set(ENV_TITLE, None);
+        let _g_scheme = EnvVarGuard::set(ENV_COLOR_SCHEME, None);
+        let _g_color = EnvVarGuard::set(ENV_COLOR, None);
+        let _g_base = EnvVarGuard::set(ENV_BASE_URL, None);
+        let _g_nb = EnvVarGuard::set(ENV_NO_BANNER, None);
+        let _g_idx = EnvVarGuard::set(ENV_SERVER_INDEX, None);
+        let _g_sv = EnvVarGuard::set(ENV_SERVER_VARS, None);
+        let _g_dh = EnvVarGuard::set(ENV_DEFAULT_HEADERS, None);
+        let _g_to = EnvVarGuard::set(ENV_TIMEOUT, None);
+        let _g_insec = EnvVarGuard::set(ENV_INSECURE, None);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_rel = "openapi.json";
+        fs::write(dir.path().join(spec_rel), minimal_openapi_json()).unwrap();
+        let manifest = LockManifest {
+            version: 1,
+            spec_path: spec_rel.to_string(),
+            title: Some("T".into()),
+            color_scheme: None,
+            color: None,
+            no_banner: true,
+            server_url: Some("https://example.test".into()),
+            server_index: 2,
+            server_vars: BTreeMap::from([("host".into(), "api".into())]),
+            default_headers: BTreeMap::from([("X-Foo".into(), "bar".into())]),
+            timeout_secs: 99,
+            insecure: true,
+            keychain_service: None,
+            keychain_auth_accounts: vec![],
+            inline_secrets: InlineSecrets::default(),
+        };
+
+        manifest.apply_to_env(dir.path()).expect("apply");
+        let spec = std::env::var(ENV_SPEC).expect("spec set");
+        assert!(spec.ends_with("openapi.json"));
+        assert_eq!(std::env::var(ENV_TITLE).ok().as_deref(), Some("T"));
+        assert_eq!(
+            std::env::var(ENV_BASE_URL).ok().as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(std::env::var(ENV_SERVER_INDEX).ok().as_deref(), Some("2"));
+        assert_eq!(std::env::var(ENV_TIMEOUT).ok().as_deref(), Some("99"));
+        assert!(env_truthy(ENV_INSECURE));
+        assert!(env_truthy(ENV_NO_BANNER));
+        let sv = std::env::var(ENV_SERVER_VARS).expect("server vars");
+        assert!(sv.contains("host"));
+        let dh = std::env::var(ENV_DEFAULT_HEADERS).expect("headers");
+        assert!(dh.contains("X-Foo"));
+    }
 }

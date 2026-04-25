@@ -84,29 +84,125 @@ fn run_cli_inner() -> Result<()> {
 /// Full CLI entry including bootstrap `lock` handling (used by the main `acli` binary).
 pub fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if let Some(rest) = lock_invocation_args(&args) {
-        let lock_cli =
-            LockCli::parse_from(std::iter::once(args[0].clone()).chain(rest.iter().cloned()));
+    if let Some(lock_idx) = find_lock_subcommand(&args) {
+        let argv = lock_cli_argv(&args, lock_idx);
+        let lock_cli = LockCli::parse_from(argv);
         return run_lock_command(lock_cli);
     }
     run_cli_inner()
 }
 
-fn lock_invocation_args(args: &[String]) -> Option<&[String]> {
+/// Position of the standalone `lock` token (not a value for a preceding flag).
+fn find_lock_subcommand(args: &[String]) -> Option<usize> {
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--spec" | "--title" | "--color-scheme" | "--color" => i += 2,
-            a if a.starts_with("--spec=")
-                || a.starts_with("--title=")
-                || a.starts_with("--color-scheme=")
-                || a.starts_with("--color=") => {}
-            "lock" => return Some(&args[i + 1..]),
-            _ => return None,
+        if args[i] == "lock" && !lock_token_is_flag_value(args, i) {
+            return Some(i);
         }
-        i += 1;
+        if current_flag_consumes_following_value(args, i) {
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
     None
+}
+
+fn lock_token_is_flag_value(args: &[String], lock_idx: usize) -> bool {
+    lock_idx > 0 && current_flag_consumes_following_value(args, lock_idx - 1)
+}
+
+/// Whether `args[i]` is a flag that takes its value from `args[i + 1]` (not `NAME=value` form).
+fn current_flag_consumes_following_value(args: &[String], i: usize) -> bool {
+    if i + 1 >= args.len() {
+        return false;
+    }
+    let a = args[i].as_str();
+    if a == "-o" {
+        return true;
+    }
+    let Some(name) = a.strip_prefix("--") else {
+        return false;
+    };
+    if a.contains('=') {
+        return false;
+    }
+    long_flag_takes_separate_value(name)
+}
+
+fn long_flag_takes_separate_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "spec"
+            | "title"
+            | "color-scheme"
+            | "color"
+            | "server-url"
+            | "server-index"
+            | "server-var"
+            | "bearer-token"
+            | "basic-user"
+            | "basic-pass"
+            | "api-key"
+            | "auth"
+            | "timeout"
+            | "output"
+            | "acli-crate-path"
+            | "crate-name"
+            | "binary-name"
+            | "secrets"
+            | "default-header"
+    )
+}
+
+/// `argv[0]` is the program name; includes every token except the `lock` word, with tokens after
+/// `lock` before tokens before `lock` so `clap` still parses `lock`-specific flags when globals
+/// precede `lock` (e.g. `acli --spec URL lock --output ./out`).
+fn lock_cli_argv(args: &[String], lock_idx: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    out.push(args[0].clone());
+    out.extend(args[lock_idx + 1..].iter().cloned());
+    out.extend(args[1..lock_idx].iter().cloned());
+    out
+}
+
+#[cfg(test)]
+mod lock_bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn find_lock_after_globals() {
+        let args = vec![
+            "acli".into(),
+            "--no-banner".into(),
+            "--server-index".into(),
+            "2".into(),
+            "lock".into(),
+            "--output".into(),
+            "/tmp/x".into(),
+        ];
+        assert_eq!(find_lock_subcommand(&args), Some(4));
+    }
+
+    #[test]
+    fn lock_not_subcommand_when_value_for_spec() {
+        let args = vec!["acli".into(), "--spec".into(), "lock".into()];
+        assert_eq!(find_lock_subcommand(&args), None);
+    }
+
+    #[test]
+    fn lock_cli_argv_merges_before_and_after() {
+        let args = vec![
+            "acli".into(),
+            "--spec".into(),
+            "s.json".into(),
+            "lock".into(),
+            "--output".into(),
+            "/out".into(),
+        ];
+        let v = lock_cli_argv(&args, 3);
+        assert_eq!(v, vec!["acli", "--output", "/out", "--spec", "s.json",]);
+    }
 }
 
 fn print_banner(theme: &Theme, title: Option<&str>, disabled: bool) {

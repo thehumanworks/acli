@@ -119,7 +119,7 @@ impl BootstrapConfig {
     }
 }
 
-fn env_truthy(name: &str) -> bool {
+pub fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|value| {
             matches!(
