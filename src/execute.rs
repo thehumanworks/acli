@@ -1,6 +1,7 @@
 use crate::colors::Theme;
 use crate::config::{
-    ENV_AUTH_PREFIX, ENV_BASE_URL, ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_SERVER_VARS,
+    sanitize_env_key, ENV_AUTH_PREFIX, ENV_BASE_URL, ENV_DEFAULT_HEADERS, ENV_INSECURE,
+    ENV_SERVER_VARS,
 };
 use crate::spec::{
     OpenApiSpec, OperationSpec, SecurityRequirement, SecuritySchemeSpec, ServerSpec,
@@ -1092,19 +1093,6 @@ fn env_truthy(name: &str) -> bool {
 fn env_auth_override(scheme_name: &str) -> Option<String> {
     let key = format!("{ENV_AUTH_PREFIX}{}", sanitize_env_key(scheme_name));
     std::env::var(key).ok()
-}
-
-fn sanitize_env_key(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn value_to_string(value: &Value) -> String {

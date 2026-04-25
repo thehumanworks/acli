@@ -15,6 +15,21 @@ pub const ENV_API_KEY: &str = "ACLI_API_KEY";
 pub const ENV_AUTH_PREFIX: &str = "ACLI_AUTH_";
 pub const ENV_TIMEOUT: &str = "ACLI_TIMEOUT_SECS";
 pub const ENV_INSECURE: &str = "ACLI_INSECURE";
+pub const ENV_SERVER_INDEX: &str = "ACLI_SERVER_INDEX";
+pub const ENV_NO_BANNER: &str = "ACLI_NO_BANNER";
+
+pub fn sanitize_env_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
@@ -33,7 +48,7 @@ impl BootstrapConfig {
         let mut title = std::env::var(ENV_TITLE).ok();
         let mut color_scheme = std::env::var(ENV_COLOR_SCHEME).ok();
         let mut color_value = std::env::var(ENV_COLOR).ok();
-        let mut no_banner = false;
+        let mut no_banner = env_truthy(ENV_NO_BANNER);
         let mut wants_help = false;
         let mut wants_version = false;
 
@@ -104,6 +119,17 @@ impl BootstrapConfig {
     }
 }
 
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 pub fn bootstrap_help(bin_name: &str) -> String {
     format!(
         r#"{bin_name}
@@ -113,6 +139,7 @@ The spec source can be an HTTPS URL, a local file path, or an inline JSON string
 
 Usage:
   {bin_name} [global options] <command> [args...]
+  {bin_name} [global options] lock [lock options]
 
 Global options:
   --spec <VALUE>           Override {ENV_SPEC}
@@ -137,6 +164,12 @@ Environment:
   {ENV_API_KEY}        Default API key fallback.
   {ENV_TIMEOUT}        Request timeout in seconds.
   {ENV_INSECURE}       Set to true/1 to disable TLS verification.
+  {ENV_SERVER_INDEX}   Default server index (non-negative integer).
+  {ENV_NO_BANNER}      Set to true/1 to suppress the banner.
+
+Lock (no spec loaded yet for this subcommand):
+  {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> [--secrets keychain|inline]
+  cargo build --release --manifest-path ./my-api-cli/Cargo.toml
 
 Examples:
   export {ENV_SPEC}='https://petstore3.swagger.io/api/v3/openapi.json'
