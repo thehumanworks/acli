@@ -81,9 +81,10 @@ cargo run -- lock \
   --api-key-env PETSTORE_API_KEY \
   --auth-env partner=PETSTORE_PARTNER_TOKEN
 
-cargo build --release --manifest-path ./petstore-cli/Cargo.toml
-PETSTORE_API_KEY=secret ./petstore-cli/target/release/petstore_cli list
+PETSTORE_API_KEY=secret petstore_cli list
 ```
+
+By default, `acli lock` writes the crate and runs `cargo install --force --path ./petstore-cli`, which builds a release binary and installs it into Cargo's bin directory. This is the most portable option because producing a new native Rust binary requires an installed Rust toolchain; a `build.rs` script would only run inside Cargo and cannot remove that requirement or reliably perform a system install. Use `--no-install` to only generate the crate, `--cargo <PROGRAM>` to select a Cargo executable, or `--install-root <DIR>` to install under a specific Cargo root.
 
 At runtime, non-empty host values are copied into `ACLI_BEARER_TOKEN`, `ACLI_API_KEY`, or `ACLI_AUTH_<SCHEME_NAME>` before the request is built.
 

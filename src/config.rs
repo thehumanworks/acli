@@ -170,7 +170,7 @@ Environment:
 Lock (no spec loaded yet for this subcommand):
   {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> [--secrets keychain|inline|env]
   {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> --secrets env --api-key-env HOST_API_KEY
-  cargo build --release --manifest-path ./my-api-cli/Cargo.toml
+  {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> --no-install
 
 Examples:
   export {ENV_SPEC}='https://petstore3.swagger.io/api/v3/openapi.json'

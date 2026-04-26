@@ -28,7 +28,7 @@ const KEYCHAIN_SERVICE_PREFIX: &str = "acli-lock";
 #[command(
     name = "acli lock",
     override_usage = "acli [global options] lock [OPTIONS]",
-    about = "Pin an OpenAPI JSON spec and config, store secrets in the keychain by default, and emit a compilable API-specific CLI crate"
+    about = "Pin an OpenAPI JSON spec and config, store secrets in the keychain by default, and build/install an API-specific CLI crate"
 )]
 pub struct LockCli {
     /// Directory for the generated crate (`Cargo.toml`, `openapi.json`, `acli.lock.json`, `src/main.rs`)
