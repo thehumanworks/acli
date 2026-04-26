@@ -502,7 +502,7 @@ fn install_generated_crate(
         .status()
         .with_context(|| {
             format!(
-                "failed to run Cargo to build and install '{binary_name}'; install a Rust toolchain from https://rustup.rs, ensure Cargo is on PATH, pass --cargo <PATH>, or pass --no-install"
+                "failed to run Cargo to build and install '{binary_name}'; install Rust from https://rustup.rs or pass --no-install"
             )
         })?;
 
@@ -1081,11 +1081,12 @@ mod tests {
 
     #[test]
     fn cargo_install_invocation_uses_force_and_optional_root() {
-        let out = Path::new("/tmp/generated-cli");
-        let root = Path::new("/tmp/install-root");
-        let cargo = Path::new("/custom/cargo");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("generated-cli");
+        let root = dir.path().join("install-root");
+        let cargo = dir.path().join("cargo");
 
-        let (program, args) = cargo_install_invocation(out, Some(cargo), Some(root));
+        let (program, args) = cargo_install_invocation(&out, Some(&cargo), Some(&root));
 
         assert_eq!(program, cargo.as_os_str());
         assert_eq!(
