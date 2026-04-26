@@ -25,7 +25,25 @@ pub fn run_locked(lock_dir: &Path) -> Result<()> {
     run_cli_inner()
 }
 
+/// Run the CLI with an embedded OpenAPI spec and lock manifest (used by installed locked binaries).
+pub fn run_locked_embedded(manifest_json: &str, spec_json: &str) -> Result<()> {
+    let manifest: lock::LockManifest =
+        serde_json::from_str(manifest_json).context("failed to parse embedded acli.lock.json")?;
+    if manifest.version != 1 {
+        anyhow::bail!(
+            "unsupported embedded acli.lock.json version {} (expected 1)",
+            manifest.version
+        );
+    }
+    manifest.apply_to_env_with_spec_source("<embedded OpenAPI spec>")?;
+    run_cli_inner_with_spec(Some(spec_json))
+}
+
 fn run_cli_inner() -> Result<()> {
+    run_cli_inner_with_spec(None)
+}
+
+fn run_cli_inner_with_spec(locked_spec_text: Option<&str>) -> Result<()> {
     let args = env::args().collect::<Vec<_>>();
     let bootstrap = BootstrapConfig::from_env_and_args(&args)?;
     let bin_name = executable_name(&args);
@@ -49,8 +67,11 @@ fn run_cli_inner() -> Result<()> {
         }
     };
 
-    let spec_text = load_spec_text(&spec_source)
-        .with_context(|| format!("failed to load OpenAPI spec from '{spec_source}'"))?;
+    let spec_text = match locked_spec_text {
+        Some(text) => text.to_string(),
+        None => load_spec_text(&spec_source)
+            .with_context(|| format!("failed to load OpenAPI spec from '{spec_source}'"))?,
+    };
     let spec = OpenApiSpec::from_json_with_source(&spec_text, Some(&spec_source))?;
 
     let command = build_command(&bin_name, &spec, &theme).color(bootstrap.color_mode.clap_choice());
@@ -155,6 +176,8 @@ fn long_flag_takes_separate_value(flag: &str) -> bool {
             | "acli-crate-path"
             | "crate-name"
             | "binary-name"
+            | "cargo"
+            | "install-root"
             | "secrets"
             | "default-header"
     )

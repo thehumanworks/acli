@@ -68,6 +68,22 @@ cargo run -- add-pet --body-file ./pet.json
 cargo run -- completions zsh > _acli
 ```
 
+## Locked CLIs
+
+`acli lock` generates an API-specific crate, embeds the pinned spec and lock manifest into the compiled binary, then runs Cargo to build and install the CLI:
+
+```bash
+cargo run -- lock \
+  --output ./petstore-cli \
+  --spec https://petstore3.swagger.io/api/v3/openapi.json
+
+petstore_cli list
+```
+
+The install step uses `cargo install --path <output> --force`, so it requires a Rust toolchain with Cargo and rustc available. `acli` does not ship Cargo or rustc; install Rust with rustup or pass `--cargo <PATH>` if Cargo is not on `PATH`. To install somewhere other than Cargo's default user bin directory, pass `--install-root <DIR>`. To only generate the crate without building or installing, pass `--no-install`.
+
+The generated crate does not use `build.rs` for installation. Cargo build scripts are designed for build-time code generation and metadata, not cross-platform installation into a user's executable path; `cargo install` is the portable Rust-native build and install mechanism.
+
 ## Locked CLI secret references
 
 `acli lock` can generate an API-specific crate without storing secret values. Use `--secrets env` and pass the host environment variable names to resolve when the generated tool starts:
@@ -81,8 +97,7 @@ cargo run -- lock \
   --api-key-env PETSTORE_API_KEY \
   --auth-env partner=PETSTORE_PARTNER_TOKEN
 
-cargo build --release --manifest-path ./petstore-cli/Cargo.toml
-PETSTORE_API_KEY=secret ./petstore-cli/target/release/petstore_cli list
+PETSTORE_API_KEY=secret petstore_cli list
 ```
 
 At runtime, non-empty host values are copied into `ACLI_BEARER_TOKEN`, `ACLI_API_KEY`, or `ACLI_AUTH_<SCHEME_NAME>` before the request is built.

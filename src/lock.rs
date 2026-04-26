@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANIFEST_FILE: &str = "acli.lock.json";
@@ -44,6 +46,18 @@ pub struct LockCli {
     /// Built binary name (default: derived from the API title)
     #[arg(long, value_name = "NAME")]
     pub binary_name: Option<String>,
+
+    /// Generate the crate without building and installing it
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub no_install: bool,
+
+    /// Cargo executable to use when installing (default: `CARGO` env var, then `cargo`)
+    #[arg(long, value_name = "PATH")]
+    pub cargo: Option<PathBuf>,
+
+    /// Cargo install root (defaults to Cargo's standard user install root)
+    #[arg(long, value_name = "DIR")]
+    pub install_root: Option<PathBuf>,
 
     /// Where to persist sensitive values: `keychain` (default), `inline` in the manifest (not recommended), or `env` references
     #[arg(long, value_parser = ["keychain", "inline", "env"], default_value = "keychain")]
@@ -201,8 +215,12 @@ impl LockManifest {
         let spec_str = spec_abs
             .to_str()
             .ok_or_else(|| anyhow!("lock directory or spec path is not valid UTF-8"))?;
+        self.apply_to_env_with_spec_source(spec_str)
+    }
+
+    pub fn apply_to_env_with_spec_source(&self, spec_source: &str) -> Result<()> {
         unsafe {
-            std::env::set_var(ENV_SPEC, spec_str);
+            std::env::set_var(ENV_SPEC, spec_source);
         }
 
         set_opt_env(ENV_TITLE, self.title.as_deref());
@@ -447,15 +465,80 @@ fn run_lock_command_inner(cli: LockCli) -> Result<()> {
 
     write_generated_crate(&cli.output, &cli.acli_crate_path, &crate_name, &binary_name)?;
 
-    eprintln!(
-        "Wrote API-specific crate under {}:\n  - Cargo.toml\n  - {}\n  - {}\n  - src/main.rs\n\nBuild:\n  cargo build --release --manifest-path {}/Cargo.toml",
-        cli.output.display(),
-        SPEC_FILE,
-        MANIFEST_FILE,
-        cli.output.display(),
-    );
+    if cli.no_install {
+        eprintln!(
+            "Wrote API-specific crate under {}:\n  - Cargo.toml\n  - {}\n  - {}\n  - src/main.rs\n\nInstall later:\n  cargo install --path {} --force",
+            cli.output.display(),
+            SPEC_FILE,
+            MANIFEST_FILE,
+            cli.output.display(),
+        );
+    } else {
+        install_generated_crate(
+            &cli.output,
+            cli.cargo.as_deref(),
+            cli.install_root.as_deref(),
+            &binary_name,
+        )?;
+        eprintln!(
+            "Wrote, built, and installed API-specific CLI '{}' from {}",
+            binary_name,
+            cli.output.display(),
+        );
+    }
 
     Ok(())
+}
+
+fn install_generated_crate(
+    output: &Path,
+    cargo: Option<&Path>,
+    install_root: Option<&Path>,
+    binary_name: &str,
+) -> Result<()> {
+    let (program, args) = cargo_install_invocation(output, cargo, install_root);
+    let status = Command::new(&program)
+        .args(&args)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to run Cargo to build and install '{binary_name}'; install a Rust toolchain from https://rustup.rs, ensure Cargo is on PATH, pass --cargo <PATH>, or pass --no-install"
+            )
+        })?;
+
+    if !status.success() {
+        bail!(
+            "Cargo failed to build and install '{}' with status {}",
+            binary_name,
+            status
+        );
+    }
+
+    Ok(())
+}
+
+fn cargo_install_invocation(
+    output: &Path,
+    cargo: Option<&Path>,
+    install_root: Option<&Path>,
+) -> (OsString, Vec<OsString>) {
+    let program = cargo
+        .map(|path| path.as_os_str().to_os_string())
+        .or_else(|| env::var_os("CARGO"))
+        .unwrap_or_else(|| OsString::from("cargo"));
+
+    let mut args = vec![
+        OsString::from("install"),
+        OsString::from("--path"),
+        output.as_os_str().to_os_string(),
+        OsString::from("--force"),
+    ];
+    if let Some(root) = install_root {
+        args.push(OsString::from("--root"));
+        args.push(root.as_os_str().to_os_string());
+    }
+
+    (program, args)
 }
 
 fn write_generated_crate(
@@ -480,9 +563,11 @@ path = "src/main.rs"
     );
     fs::write(output.join("Cargo.toml"), cargo_toml)?;
 
-    let main_rs = r#"fn main() {
-    let lock_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Err(e) = acli::run_locked(&lock_dir) {
+    let main_rs = r#"const MANIFEST_JSON: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/acli.lock.json"));
+const SPEC_JSON: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.json"));
+
+fn main() {
+    if let Err(e) = acli::run_locked_embedded(MANIFEST_JSON, SPEC_JSON) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
@@ -932,6 +1017,7 @@ mod tests {
 
         let cli = LockCli::try_parse_from([
             "testprog",
+            "--no-install",
             "--output",
             out.to_str().unwrap(),
             "--spec",
@@ -967,6 +1053,55 @@ mod tests {
     }
 
     #[test]
+    fn generated_crate_embeds_manifest_and_spec() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_path = dir.path().join("source.json");
+        fs::write(&spec_path, minimal_openapi_json()).unwrap();
+        let out = dir.path().join("out");
+
+        let cli = LockCli::try_parse_from([
+            "testprog",
+            "--no-install",
+            "--output",
+            out.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+            "--secrets",
+            "env",
+        ])
+        .expect("parse");
+
+        run_lock_command_inner(cli).expect("lock");
+        let main_rs = fs::read_to_string(out.join("src").join("main.rs")).expect("main");
+
+        assert!(main_rs.contains("include_str!"));
+        assert!(main_rs.contains("run_locked_embedded"));
+    }
+
+    #[test]
+    fn cargo_install_invocation_uses_force_and_optional_root() {
+        let out = Path::new("/tmp/generated-cli");
+        let root = Path::new("/tmp/install-root");
+        let cargo = Path::new("/custom/cargo");
+
+        let (program, args) = cargo_install_invocation(out, Some(cargo), Some(root));
+
+        assert_eq!(program, cargo.as_os_str());
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("install"),
+                OsString::from("--path"),
+                out.as_os_str().to_os_string(),
+                OsString::from("--force"),
+                OsString::from("--root"),
+                root.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn env_secret_refs_can_point_to_standard_acli_secret_env_vars() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _g_api_key = EnvVarGuard::set(ENV_API_KEY, Some("runtime-only"));
@@ -977,6 +1112,7 @@ mod tests {
 
         let cli = LockCli::try_parse_from([
             "testprog",
+            "--no-install",
             "--output",
             out.to_str().unwrap(),
             "--spec",
@@ -1006,6 +1142,7 @@ mod tests {
 
         let cli = LockCli::try_parse_from([
             "testprog",
+            "--no-install",
             "--output",
             out.to_str().unwrap(),
             "--spec",
