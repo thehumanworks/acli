@@ -1004,9 +1004,38 @@ fn parse_json_string_map(input: Option<&str>, env_name: &str) -> Result<BTreeMap
         .ok_or_else(|| anyhow!("{env_name} must be a JSON object"))?;
     let mut out = BTreeMap::new();
     for (key, value) in object {
-        out.insert(key.clone(), value_to_string(value));
+        let value = value_to_string(value);
+        out.insert(key.clone(), expand_env_templates(&value, env_name)?);
     }
     Ok(out)
+}
+
+fn expand_env_templates(input: &str, env_name: &str) -> Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find("{{.") {
+        output.push_str(&rest[..start]);
+        let after_open = &rest[start + 3..];
+        let Some(end) = after_open.find("}}") else {
+            bail!("{env_name} contains an unterminated environment template");
+        };
+        let var_name = after_open[..end].trim();
+        if var_name.is_empty() {
+            bail!("{env_name} contains an empty environment template");
+        }
+        let value = std::env::var(var_name).with_context(|| {
+            format!("{env_name} references missing environment variable {var_name}")
+        })?;
+        if value.is_empty() {
+            bail!("{env_name} references empty environment variable {var_name}");
+        }
+        output.push_str(&value);
+        rest = &after_open[end + 2..];
+    }
+
+    output.push_str(rest);
+    Ok(output)
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) -> Result<HeaderName> {
@@ -1418,6 +1447,44 @@ mod tests {
 
         assert!(
             error.to_string().contains("ACLI_DEFAULT_HEADERS"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn parse_json_string_map_expands_env_templates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _api_key = EnvVarGuard::set("API_KEY", Some("runtime-secret"));
+
+        let headers = parse_json_string_map(
+            Some(r#"{"Authorization":"Bearer {{.API_KEY}}","X-Trace":"id-{{.API_KEY}}"}"#),
+            "ACLI_DEFAULT_HEADERS",
+        )
+        .expect("parse");
+
+        assert_eq!(
+            headers.get("Authorization").map(String::as_str),
+            Some("Bearer runtime-secret")
+        );
+        assert_eq!(
+            headers.get("X-Trace").map(String::as_str),
+            Some("id-runtime-secret")
+        );
+    }
+
+    #[test]
+    fn parse_json_string_map_errors_for_missing_env_templates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _api_key = EnvVarGuard::set("API_KEY", None);
+
+        let error = parse_json_string_map(
+            Some(r#"{"Authorization":"Bearer {{.API_KEY}}"}"#),
+            "ACLI_DEFAULT_HEADERS",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("API_KEY"),
             "unexpected error: {error:#}"
         );
     }

@@ -17,6 +17,7 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
   - HTTP basic
   - apiKey in header/query/cookie
   - oauth2/openIdConnect token passthrough
+- Can generate API-specific locked CLIs that resolve secret values from host environment variables at runtime
 - Supports shell completions
 - Renders an optional ASCII-art banner from `ACLI_TITLE`
 - Applies an optional color theme from `ACLI_COLOR_SCHEME`
@@ -66,6 +67,45 @@ cargo run -- get-pet-by-id --pet-id 123
 cargo run -- add-pet --body-file ./pet.json
 cargo run -- completions zsh > _acli
 ```
+
+## Locked CLI secret references
+
+`acli lock` can generate an API-specific crate without storing secret values. Use `--secrets env` and pass the host environment variable names to resolve when the generated tool starts:
+
+```bash
+cargo run -- lock \
+  --output ./petstore-cli \
+  --spec https://petstore3.swagger.io/api/v3/openapi.json \
+  --secrets env \
+  --bearer-token-env PETSTORE_BEARER_TOKEN \
+  --api-key-env PETSTORE_API_KEY \
+  --auth-env partner=PETSTORE_PARTNER_TOKEN
+
+cargo build --release --manifest-path ./petstore-cli/Cargo.toml
+PETSTORE_API_KEY=secret ./petstore-cli/target/release/petstore_cli list
+```
+
+At runtime, non-empty host values are copied into `ACLI_BEARER_TOKEN`, `ACLI_API_KEY`, or `ACLI_AUTH_<SCHEME_NAME>` before the request is built.
+
+Default headers also support runtime environment templates with `{{.ENV_VAR}}` placeholders:
+
+```bash
+export API_KEY=secret
+export ACLI_DEFAULT_HEADERS='{"Authorization":"Bearer {{.API_KEY}}"}'
+```
+
+Missing or empty template variables are reported as configuration errors.
+
+## Binary downloads
+
+Pushes to `main` build Linux, macOS, and Windows binaries with GitHub Actions. Download the latest main-branch artifacts from the `Build binaries` workflow run.
+
+Version tags that start with `v` also publish archives and SHA-256 checksum files to GitHub Releases:
+
+- `acli-linux-x86_64.tar.gz`
+- `acli-macos-x86_64.tar.gz`
+- `acli-macos-aarch64.tar.gz`
+- `acli-windows-x86_64.zip`
 
 ## Generated command shape
 

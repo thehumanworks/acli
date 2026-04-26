@@ -157,7 +157,7 @@ Environment:
   {ENV_COLOR}          Optional color mode (auto|always|never).
   {ENV_BASE_URL}       Optional base URL override when the spec has no usable server.
   {ENV_SERVER_VARS}    Optional JSON object for server template variable overrides.
-  {ENV_DEFAULT_HEADERS} Optional JSON object of headers to send with every request.
+  {ENV_DEFAULT_HEADERS} Optional JSON object of headers to send with every request; values may use {{{{.ENV_VAR}}}} templates.
   {ENV_BEARER_TOKEN}   Default bearer token.
   {ENV_BASIC_USER}     Default HTTP basic username.
   {ENV_BASIC_PASS}     Default HTTP basic password.
@@ -168,7 +168,8 @@ Environment:
   {ENV_NO_BANNER}      Set to true/1 to suppress the banner.
 
 Lock (no spec loaded yet for this subcommand):
-  {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> [--secrets keychain|inline]
+  {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> [--secrets keychain|inline|env]
+  {bin_name} lock --output ./my-api-cli --spec <URL|PATH|JSON> --secrets env --api-key-env HOST_API_KEY
   cargo build --release --manifest-path ./my-api-cli/Cargo.toml
 
 Examples:

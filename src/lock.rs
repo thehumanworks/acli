@@ -45,8 +45,8 @@ pub struct LockCli {
     #[arg(long, value_name = "NAME")]
     pub binary_name: Option<String>,
 
-    /// Where to persist sensitive values: `keychain` (default) or `inline` in the manifest (not recommended)
-    #[arg(long, value_parser = ["keychain", "inline"], default_value = "keychain")]
+    /// Where to persist sensitive values: `keychain` (default), `inline` in the manifest (not recommended), or `env` references
+    #[arg(long, value_parser = ["keychain", "inline", "env"], default_value = "keychain")]
     pub secrets: String,
 
     /// OpenAPI spec source (URL, path, or JSON); defaults to `ACLI_SPEC`
@@ -83,20 +83,40 @@ pub struct LockCli {
     #[arg(long, action = clap::ArgAction::SetTrue, env = ENV_INSECURE)]
     pub insecure: bool,
 
-    #[arg(long, env = ENV_BEARER_TOKEN)]
+    #[arg(long)]
     pub bearer_token: Option<String>,
 
-    #[arg(long, env = ENV_BASIC_USER)]
+    /// Host environment variable to read for the default bearer token when `--secrets env` is used
+    #[arg(long, value_name = "ENV_VAR")]
+    pub bearer_token_env: Option<String>,
+
+    #[arg(long)]
     pub basic_user: Option<String>,
 
-    #[arg(long, env = ENV_BASIC_PASS)]
+    /// Host environment variable to read for the default basic auth username when `--secrets env` is used
+    #[arg(long, value_name = "ENV_VAR")]
+    pub basic_user_env: Option<String>,
+
+    #[arg(long)]
     pub basic_pass: Option<String>,
 
-    #[arg(long, env = ENV_API_KEY)]
+    /// Host environment variable to read for the default basic auth password when `--secrets env` is used
+    #[arg(long, value_name = "ENV_VAR")]
+    pub basic_pass_env: Option<String>,
+
+    #[arg(long)]
     pub api_key: Option<String>,
+
+    /// Host environment variable to read for the default api key when `--secrets env` is used
+    #[arg(long, value_name = "ENV_VAR")]
+    pub api_key_env: Option<String>,
 
     #[arg(long, value_name = "SCHEME=VALUE", action = clap::ArgAction::Append)]
     pub auth: Vec<String>,
+
+    /// Named auth env reference when `--secrets env` is used, e.g. `partner=PARTNER_TOKEN`
+    #[arg(long, value_name = "SCHEME=ENV_VAR", action = clap::ArgAction::Append)]
+    pub auth_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +147,8 @@ pub struct LockManifest {
     pub keychain_auth_accounts: Vec<String>,
     #[serde(default, skip_serializing_if = "InlineSecrets::is_empty")]
     pub inline_secrets: InlineSecrets,
+    #[serde(default, skip_serializing_if = "EnvSecrets::is_empty")]
+    pub env_secrets: EnvSecrets,
 }
 
 fn default_timeout() -> u64 {
@@ -144,6 +166,26 @@ pub struct InlineSecrets {
 }
 
 impl InlineSecrets {
+    fn is_empty(&self) -> bool {
+        self.bearer_token.is_none()
+            && self.basic_user.is_none()
+            && self.basic_pass.is_none()
+            && self.api_key.is_none()
+            && self.auth.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnvSecrets {
+    pub bearer_token: Option<String>,
+    pub basic_user: Option<String>,
+    pub basic_pass: Option<String>,
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub auth: BTreeMap<String, String>,
+}
+
+impl EnvSecrets {
     fn is_empty(&self) -> bool {
         self.bearer_token.is_none()
             && self.basic_user.is_none()
@@ -204,6 +246,8 @@ impl LockManifest {
         if let Some(service) = &self.keychain_service {
             apply_keychain_secrets(service, &self.keychain_auth_accounts)?;
         }
+
+        apply_env_secret_refs(&self.env_secrets);
 
         if let Some(token) = &self.inline_secrets.bearer_token {
             unsafe {
@@ -270,6 +314,30 @@ fn apply_keychain_secrets(service: &str, auth_accounts: &[String]) -> Result<()>
     Ok(())
 }
 
+fn apply_env_secret_refs(env_secrets: &EnvSecrets) {
+    set_env_from_host_ref(ENV_BEARER_TOKEN, env_secrets.bearer_token.as_deref());
+    set_env_from_host_ref(ENV_BASIC_USER, env_secrets.basic_user.as_deref());
+    set_env_from_host_ref(ENV_BASIC_PASS, env_secrets.basic_pass.as_deref());
+    set_env_from_host_ref(ENV_API_KEY, env_secrets.api_key.as_deref());
+    for (scheme, host_env) in &env_secrets.auth {
+        let target_env = format!("{ENV_AUTH_PREFIX}{}", sanitize_env_key(scheme));
+        set_env_from_host_ref(&target_env, Some(host_env));
+    }
+}
+
+fn set_env_from_host_ref(target_env: &str, host_env: Option<&str>) {
+    let Some(host_env) = host_env.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if let Ok(value) = std::env::var(host_env) {
+        if !value.is_empty() {
+            unsafe {
+                std::env::set_var(target_env, value);
+            }
+        }
+    }
+}
+
 pub fn read_manifest(lock_dir: &Path) -> Result<LockManifest> {
     let path = lock_dir.join(MANIFEST_FILE);
     let text = fs::read_to_string(&path)
@@ -323,21 +391,32 @@ fn run_lock_command_inner(cli: LockCli) -> Result<()> {
 
     let mut keychain_auth_accounts = Vec::new();
     let mut inline = InlineSecrets::default();
-    let keychain_service = if cli.secrets == "inline" {
-        store_inline_from_cli(&cli, &mut inline)?;
-        None
-    } else {
-        let service = format!(
-            "{}-{}-{}",
-            KEYCHAIN_SERVICE_PREFIX,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
-        store_secrets_in_keychain(&service, &cli, &mut inline, &mut keychain_auth_accounts)?;
-        Some(service)
+    let mut env_secrets = EnvSecrets::default();
+    let keychain_service = match cli.secrets.as_str() {
+        "inline" => {
+            reject_env_secret_refs(&cli)?;
+            store_inline_from_cli(&cli, &mut inline)?;
+            None
+        }
+        "env" => {
+            reject_literal_secret_values(&cli)?;
+            store_env_refs_from_cli(&cli, &mut env_secrets)?;
+            None
+        }
+        _ => {
+            reject_env_secret_refs(&cli)?;
+            let service = format!(
+                "{}-{}-{}",
+                KEYCHAIN_SERVICE_PREFIX,
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            );
+            store_secrets_in_keychain(&service, &cli, &mut inline, &mut keychain_auth_accounts)?;
+            Some(service)
+        }
     };
 
     let manifest = LockManifest {
@@ -356,6 +435,7 @@ fn run_lock_command_inner(cli: LockCli) -> Result<()> {
         keychain_service,
         keychain_auth_accounts,
         inline_secrets: inline,
+        env_secrets,
     };
 
     let manifest_path = cli.output.join(MANIFEST_FILE);
@@ -506,13 +586,69 @@ fn parse_one_pair(pair: &str, flag: &str) -> Result<(String, String)> {
 }
 
 fn store_inline_from_cli(cli: &LockCli, inline: &mut InlineSecrets) -> Result<()> {
-    inline.bearer_token = cli.bearer_token.clone();
-    inline.basic_user = cli.basic_user.clone();
-    inline.basic_pass = cli.basic_pass.clone();
-    inline.api_key = cli.api_key.clone();
+    inline.bearer_token = secret_value(cli.bearer_token.as_deref(), ENV_BEARER_TOKEN);
+    inline.basic_user = secret_value(cli.basic_user.as_deref(), ENV_BASIC_USER);
+    inline.basic_pass = secret_value(cli.basic_pass.as_deref(), ENV_BASIC_PASS);
+    inline.api_key = secret_value(cli.api_key.as_deref(), ENV_API_KEY);
     for pair in &cli.auth {
         let (scheme, value) = parse_one_pair(pair, "auth")?;
         inline.auth.insert(scheme, value);
+    }
+    Ok(())
+}
+
+fn secret_value(cli_value: Option<&str>, env_key: &str) -> Option<String> {
+    cli_value
+        .map(ToOwned::to_owned)
+        .or_else(|| env::var(env_key).ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn store_env_refs_from_cli(cli: &LockCli, env_secrets: &mut EnvSecrets) -> Result<()> {
+    env_secrets.bearer_token =
+        normalize_env_ref(cli.bearer_token_env.as_deref(), "bearer-token-env")?;
+    env_secrets.basic_user = normalize_env_ref(cli.basic_user_env.as_deref(), "basic-user-env")?;
+    env_secrets.basic_pass = normalize_env_ref(cli.basic_pass_env.as_deref(), "basic-pass-env")?;
+    env_secrets.api_key = normalize_env_ref(cli.api_key_env.as_deref(), "api-key-env")?;
+    for pair in &cli.auth_env {
+        let (scheme, env_name) = parse_one_pair(pair, "auth-env")?;
+        let env_name = normalize_env_ref(Some(&env_name), "auth-env")?
+            .ok_or_else(|| anyhow!("auth-env expects a non-empty environment variable name"))?;
+        env_secrets.auth.insert(scheme, env_name);
+    }
+    Ok(())
+}
+
+fn normalize_env_ref(value: Option<&str>, flag: &str) -> Result<Option<String>> {
+    let Some(trimmed) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.contains('=') {
+        bail!("{flag} expects an environment variable name, not NAME=VALUE");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn reject_env_secret_refs(cli: &LockCli) -> Result<()> {
+    if cli.bearer_token_env.is_some()
+        || cli.basic_user_env.is_some()
+        || cli.basic_pass_env.is_some()
+        || cli.api_key_env.is_some()
+        || !cli.auth_env.is_empty()
+    {
+        bail!("secret environment reference flags require --secrets env");
+    }
+    Ok(())
+}
+
+fn reject_literal_secret_values(cli: &LockCli) -> Result<()> {
+    if cli.bearer_token.is_some()
+        || cli.basic_user.is_some()
+        || cli.basic_pass.is_some()
+        || cli.api_key.is_some()
+        || !cli.auth.is_empty()
+    {
+        bail!("literal secret value flags cannot be used with --secrets env; use --*-env flags instead");
     }
     Ok(())
 }
@@ -523,17 +659,17 @@ fn store_secrets_in_keychain(
     _inline: &mut InlineSecrets,
     auth_accounts: &mut Vec<String>,
 ) -> Result<()> {
-    if let Some(token) = &cli.bearer_token {
-        keychain_set(service, ENV_BEARER_TOKEN, token)?;
+    if let Some(token) = secret_value(cli.bearer_token.as_deref(), ENV_BEARER_TOKEN) {
+        keychain_set(service, ENV_BEARER_TOKEN, &token)?;
     }
-    if let Some(user) = &cli.basic_user {
-        keychain_set(service, ENV_BASIC_USER, user)?;
+    if let Some(user) = secret_value(cli.basic_user.as_deref(), ENV_BASIC_USER) {
+        keychain_set(service, ENV_BASIC_USER, &user)?;
     }
-    if let Some(pass) = &cli.basic_pass {
-        keychain_set(service, ENV_BASIC_PASS, pass)?;
+    if let Some(pass) = secret_value(cli.basic_pass.as_deref(), ENV_BASIC_PASS) {
+        keychain_set(service, ENV_BASIC_PASS, &pass)?;
     }
-    if let Some(key) = &cli.api_key {
-        keychain_set(service, ENV_API_KEY, key)?;
+    if let Some(key) = secret_value(cli.api_key.as_deref(), ENV_API_KEY) {
+        keychain_set(service, ENV_API_KEY, &key)?;
     }
     for pair in &cli.auth {
         let (scheme, value) = parse_one_pair(pair, "auth")?;
@@ -650,6 +786,7 @@ mod tests {
             keychain_service: None,
             keychain_auth_accounts: vec![],
             inline_secrets: InlineSecrets::default(),
+            env_secrets: EnvSecrets::default(),
         };
         fs::write(
             dir.path().join(MANIFEST_FILE),
@@ -700,6 +837,7 @@ mod tests {
             keychain_service: None,
             keychain_auth_accounts: vec![],
             inline_secrets: InlineSecrets::default(),
+            env_secrets: EnvSecrets::default(),
         };
 
         manifest.apply_to_env(dir.path()).expect("apply");
@@ -718,5 +856,172 @@ mod tests {
         assert!(sv.contains("host"));
         let dh = std::env::var(ENV_DEFAULT_HEADERS).expect("headers");
         assert!(dh.contains("X-Foo"));
+    }
+
+    #[test]
+    fn apply_to_env_resolves_secret_env_refs_at_runtime() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g_bearer = EnvVarGuard::set(ENV_BEARER_TOKEN, None);
+        let _g_basic_user = EnvVarGuard::set(ENV_BASIC_USER, None);
+        let _g_basic_pass = EnvVarGuard::set(ENV_BASIC_PASS, None);
+        let _g_api_key = EnvVarGuard::set(ENV_API_KEY, None);
+        let _g_auth = EnvVarGuard::set("ACLI_AUTH_PARTNER", None);
+        let _g_host_token = EnvVarGuard::set("HOST_BEARER_TOKEN", Some("runtime-token"));
+        let _g_host_user = EnvVarGuard::set("HOST_BASIC_USER", Some("runtime-user"));
+        let _g_host_pass = EnvVarGuard::set("HOST_BASIC_PASS", Some(""));
+        let _g_host_api = EnvVarGuard::set("HOST_API_KEY", Some("runtime-key"));
+        let _g_host_auth = EnvVarGuard::set("HOST_PARTNER_TOKEN", Some("runtime-partner"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_rel = "openapi.json";
+        fs::write(dir.path().join(spec_rel), minimal_openapi_json()).unwrap();
+        let manifest = LockManifest {
+            version: 1,
+            spec_path: spec_rel.to_string(),
+            title: None,
+            color_scheme: None,
+            color: None,
+            no_banner: false,
+            server_url: None,
+            server_index: 0,
+            server_vars: BTreeMap::new(),
+            default_headers: BTreeMap::new(),
+            timeout_secs: 30,
+            insecure: false,
+            keychain_service: None,
+            keychain_auth_accounts: vec![],
+            inline_secrets: InlineSecrets::default(),
+            env_secrets: EnvSecrets {
+                bearer_token: Some("HOST_BEARER_TOKEN".into()),
+                basic_user: Some("HOST_BASIC_USER".into()),
+                basic_pass: Some("HOST_BASIC_PASS".into()),
+                api_key: Some("HOST_API_KEY".into()),
+                auth: BTreeMap::from([("partner".into(), "HOST_PARTNER_TOKEN".into())]),
+            },
+        };
+
+        manifest.apply_to_env(dir.path()).expect("apply");
+
+        assert_eq!(
+            std::env::var(ENV_BEARER_TOKEN).ok().as_deref(),
+            Some("runtime-token")
+        );
+        assert_eq!(
+            std::env::var(ENV_BASIC_USER).ok().as_deref(),
+            Some("runtime-user")
+        );
+        assert_eq!(std::env::var(ENV_BASIC_PASS).ok(), None);
+        assert_eq!(
+            std::env::var(ENV_API_KEY).ok().as_deref(),
+            Some("runtime-key")
+        );
+        assert_eq!(
+            std::env::var("ACLI_AUTH_PARTNER").ok().as_deref(),
+            Some("runtime-partner")
+        );
+    }
+
+    #[test]
+    fn env_secret_refs_are_serialized_from_lock_cli() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g_api_key = EnvVarGuard::set(ENV_API_KEY, None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_path = dir.path().join("source.json");
+        fs::write(&spec_path, minimal_openapi_json()).unwrap();
+        let out = dir.path().join("out");
+
+        let cli = LockCli::try_parse_from([
+            "testprog",
+            "--output",
+            out.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+            "--secrets",
+            "env",
+            "--bearer-token-env",
+            "HOST_BEARER_TOKEN",
+            "--api-key-env",
+            "HOST_API_KEY",
+            "--auth-env",
+            "partner=HOST_PARTNER_TOKEN",
+        ])
+        .expect("parse");
+
+        run_lock_command_inner(cli).expect("lock");
+        let manifest = read_manifest(&out).expect("manifest");
+
+        assert_eq!(
+            manifest.env_secrets.bearer_token.as_deref(),
+            Some("HOST_BEARER_TOKEN")
+        );
+        assert_eq!(
+            manifest.env_secrets.api_key.as_deref(),
+            Some("HOST_API_KEY")
+        );
+        assert_eq!(
+            manifest.env_secrets.auth.get("partner").map(String::as_str),
+            Some("HOST_PARTNER_TOKEN")
+        );
+        assert!(manifest.inline_secrets.is_empty());
+        assert!(manifest.keychain_service.is_none());
+    }
+
+    #[test]
+    fn env_secret_refs_can_point_to_standard_acli_secret_env_vars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g_api_key = EnvVarGuard::set(ENV_API_KEY, Some("runtime-only"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_path = dir.path().join("source.json");
+        fs::write(&spec_path, minimal_openapi_json()).unwrap();
+        let out = dir.path().join("out");
+
+        let cli = LockCli::try_parse_from([
+            "testprog",
+            "--output",
+            out.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+            "--secrets",
+            "env",
+            "--api-key-env",
+            ENV_API_KEY,
+        ])
+        .expect("parse");
+
+        run_lock_command_inner(cli).expect("lock");
+        let manifest = read_manifest(&out).expect("manifest");
+
+        assert_eq!(manifest.env_secrets.api_key.as_deref(), Some(ENV_API_KEY));
+        assert!(manifest.inline_secrets.is_empty());
+    }
+
+    #[test]
+    fn inline_secret_mode_still_reads_standard_secret_env_vars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g_api_key = EnvVarGuard::set(ENV_API_KEY, Some("inline-from-env"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spec_path = dir.path().join("source.json");
+        fs::write(&spec_path, minimal_openapi_json()).unwrap();
+        let out = dir.path().join("out");
+
+        let cli = LockCli::try_parse_from([
+            "testprog",
+            "--output",
+            out.to_str().unwrap(),
+            "--spec",
+            spec_path.to_str().unwrap(),
+            "--secrets",
+            "inline",
+        ])
+        .expect("parse");
+
+        run_lock_command_inner(cli).expect("lock");
+        let manifest = read_manifest(&out).expect("manifest");
+
+        assert_eq!(
+            manifest.inline_secrets.api_key.as_deref(),
+            Some("inline-from-env")
+        );
+        assert!(manifest.env_secrets.is_empty());
     }
 }
