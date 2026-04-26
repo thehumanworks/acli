@@ -36,8 +36,8 @@ pub struct LockCli {
     pub output: PathBuf,
 
     /// Generate the locked crate without building or installing it
-    #[arg(long = "no-install", action = clap::ArgAction::SetFalse, default_value_t = true)]
-    pub install: bool,
+    #[arg(long = "no-install", action = clap::ArgAction::SetTrue)]
+    pub skip_install: bool,
 
     /// Cargo executable used for installation
     #[arg(long, value_name = "PROGRAM", default_value = "cargo")]
@@ -461,7 +461,7 @@ fn run_lock_command_inner(cli: LockCli) -> Result<()> {
 
     write_generated_crate(&cli.output, &cli.acli_crate_path, &crate_name, &binary_name)?;
 
-    if cli.install {
+    if !cli.skip_install {
         install_generated_crate(&cli.output, &cli.cargo_bin, cli.install_root.as_deref())?;
         eprintln!(
             "Wrote, built, and installed API-specific CLI '{binary_name}' from {}",
@@ -491,7 +491,7 @@ fn install_generated_crate(
         .status()
         .with_context(|| {
             format!(
-                "failed to run cargo install; ensure Rust and Cargo are installed and '{}' is on PATH",
+                "failed to run cargo install; ensure Rust and Cargo are installed and '{}' is a valid executable path",
                 cargo_bin.display()
             )
         })?;
@@ -1102,10 +1102,10 @@ mod tests {
     #[test]
     fn lock_cli_installs_by_default_and_can_opt_out() {
         let default_cli = LockCli::try_parse_from(["testprog"]).expect("parse default");
-        assert!(default_cli.install);
+        assert!(!default_cli.skip_install);
 
         let no_install_cli =
             LockCli::try_parse_from(["testprog", "--no-install"]).expect("parse no-install");
-        assert!(!no_install_cli.install);
+        assert!(no_install_cli.skip_install);
     }
 }
