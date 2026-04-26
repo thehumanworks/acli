@@ -6,6 +6,9 @@
 /.cargo/.package-cache
 /.cargo/.global-cache
 
+whoop-cli
+hevy-cli 
+
 # Pixi environments
 .pixi/*
 !.pixi/config.toml
