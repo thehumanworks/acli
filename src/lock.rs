@@ -230,7 +230,7 @@ impl LockManifest {
 
         if self.no_banner {
             unsafe {
-                std::env::set_var(ENV_NO_BANNER, "1");
+                std::env::set_var(ENV_NO_BANNER, "true");
             }
         }
 
@@ -257,7 +257,7 @@ impl LockManifest {
         }
         if self.insecure {
             unsafe {
-                std::env::set_var(ENV_INSECURE, "1");
+                std::env::set_var(ENV_INSECURE, "true");
             }
         }
 
