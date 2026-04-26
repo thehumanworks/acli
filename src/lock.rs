@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANIFEST_FILE: &str = "acli.lock.json";
@@ -32,6 +34,18 @@ pub struct LockCli {
     /// Directory for the generated crate (`Cargo.toml`, `openapi.json`, `acli.lock.json`, `src/main.rs`)
     #[arg(long, value_name = "DIR", default_value = ".")]
     pub output: PathBuf,
+
+    /// Generate the locked crate without building or installing it
+    #[arg(long = "no-install", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    pub install: bool,
+
+    /// Cargo executable used for installation
+    #[arg(long, value_name = "PROGRAM", default_value = "cargo")]
+    pub cargo_bin: PathBuf,
+
+    /// Install under this Cargo root instead of the default Cargo home
+    #[arg(long, value_name = "DIR")]
+    pub install_root: Option<PathBuf>,
 
     /// Path to the `acli` package root from the generated crate (used in `Cargo.toml`)
     #[arg(long, value_name = "PATH", default_value = "..")]
@@ -447,15 +461,58 @@ fn run_lock_command_inner(cli: LockCli) -> Result<()> {
 
     write_generated_crate(&cli.output, &cli.acli_crate_path, &crate_name, &binary_name)?;
 
-    eprintln!(
-        "Wrote API-specific crate under {}:\n  - Cargo.toml\n  - {}\n  - {}\n  - src/main.rs\n\nBuild:\n  cargo build --release --manifest-path {}/Cargo.toml",
-        cli.output.display(),
-        SPEC_FILE,
-        MANIFEST_FILE,
-        cli.output.display(),
-    );
+    if cli.install {
+        install_generated_crate(&cli.output, &cli.cargo_bin, cli.install_root.as_deref())?;
+        eprintln!(
+            "Wrote, built, and installed API-specific CLI '{binary_name}' from {}",
+            cli.output.display()
+        );
+    } else {
+        eprintln!(
+            "Wrote API-specific crate under {}:\n  - Cargo.toml\n  - {}\n  - {}\n  - src/main.rs\n\nInstall later:\n  cargo install --force --path {}",
+            cli.output.display(),
+            SPEC_FILE,
+            MANIFEST_FILE,
+            cli.output.display(),
+        );
+    }
 
     Ok(())
+}
+
+fn install_generated_crate(
+    output: &Path,
+    cargo_bin: &Path,
+    install_root: Option<&Path>,
+) -> Result<()> {
+    let args = cargo_install_args(output, install_root);
+    let status = Command::new(cargo_bin)
+        .args(&args)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to run cargo install; ensure Rust and Cargo are installed and '{}' is on PATH",
+                cargo_bin.display()
+            )
+        })?;
+    if !status.success() {
+        bail!("cargo install failed with status {status}");
+    }
+    Ok(())
+}
+
+fn cargo_install_args(output: &Path, install_root: Option<&Path>) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("install"),
+        OsString::from("--force"),
+        OsString::from("--path"),
+        output.as_os_str().to_os_string(),
+    ];
+    if let Some(root) = install_root {
+        args.push(OsString::from("--root"));
+        args.push(root.as_os_str().to_os_string());
+    }
+    args
 }
 
 fn write_generated_crate(
@@ -936,6 +993,7 @@ mod tests {
             out.to_str().unwrap(),
             "--spec",
             spec_path.to_str().unwrap(),
+            "--no-install",
             "--secrets",
             "env",
             "--bearer-token-env",
@@ -981,6 +1039,7 @@ mod tests {
             out.to_str().unwrap(),
             "--spec",
             spec_path.to_str().unwrap(),
+            "--no-install",
             "--secrets",
             "env",
             "--api-key-env",
@@ -1010,6 +1069,7 @@ mod tests {
             out.to_str().unwrap(),
             "--spec",
             spec_path.to_str().unwrap(),
+            "--no-install",
             "--secrets",
             "inline",
         ])
@@ -1023,5 +1083,29 @@ mod tests {
             Some("inline-from-env")
         );
         assert!(manifest.env_secrets.is_empty());
+    }
+
+    #[test]
+    fn cargo_install_args_include_force_path_and_optional_root() {
+        let output = Path::new("generated-cli");
+        let root = Path::new("install-root");
+        let args = cargo_install_args(output, Some(root));
+
+        assert_eq!(args[0], OsString::from("install"));
+        assert_eq!(args[1], OsString::from("--force"));
+        assert_eq!(args[2], OsString::from("--path"));
+        assert_eq!(args[3], OsString::from("generated-cli"));
+        assert_eq!(args[4], OsString::from("--root"));
+        assert_eq!(args[5], OsString::from("install-root"));
+    }
+
+    #[test]
+    fn lock_cli_installs_by_default_and_can_opt_out() {
+        let default_cli = LockCli::try_parse_from(["testprog"]).expect("parse default");
+        assert!(default_cli.install);
+
+        let no_install_cli =
+            LockCli::try_parse_from(["testprog", "--no-install"]).expect("parse no-install");
+        assert!(!no_install_cli.install);
     }
 }
