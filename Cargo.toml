@@ -25,6 +25,7 @@ percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = { version = "0.8", features = ["preserve_order"] }
 url = "=2.4.1"
 
 [dev-dependencies]

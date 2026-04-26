@@ -1,3 +1,4 @@
+use crate::app_config::{AcliConfig, SecretConfig};
 use crate::colors::Theme;
 use crate::config::{
     sanitize_env_key, ENV_AUTH_PREFIX, ENV_BASE_URL, ENV_DEFAULT_HEADERS, ENV_INSECURE,
@@ -7,6 +8,7 @@ use crate::spec::{
     OpenApiSpec, OperationSpec, SecurityRequirement, SecuritySchemeSpec, ServerSpec,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use clap::parser::ValueSource;
 use clap::{ArgMatches, Command};
 use clap_complete::aot::{generate, Shell};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -28,6 +30,7 @@ pub fn run(
     theme: &Theme,
     matches: &ArgMatches,
     mut command: Command,
+    config: Option<&AcliConfig>,
 ) -> Result<()> {
     match matches.subcommand() {
         Some(("list", sub_matches)) => list_operations(spec, theme, sub_matches),
@@ -37,7 +40,7 @@ pub fn run(
             let operation = spec
                 .find_operation(operation_name)
                 .ok_or_else(|| anyhow!("unknown operation '{operation_name}'"))?;
-            invoke_operation(spec, operation, theme, matches, sub_matches)
+            invoke_operation(spec, operation, theme, matches, sub_matches, config)
         }
         None => Ok(()),
     }
@@ -309,8 +312,9 @@ fn invoke_operation(
     theme: &Theme,
     root_matches: &ArgMatches,
     sub_matches: &ArgMatches,
+    config: Option<&AcliConfig>,
 ) -> Result<()> {
-    let runtime = RuntimeOptions::from_matches(root_matches)?;
+    let runtime = RuntimeOptions::from_matches(root_matches, config)?;
     let invocation = InvocationInput::from_matches(operation, sub_matches)?;
 
     let server_url = resolve_server_url(spec, operation, &runtime)?;
@@ -388,43 +392,103 @@ struct RuntimeOptions {
 }
 
 impl RuntimeOptions {
-    fn from_matches(matches: &ArgMatches) -> Result<Self> {
+    fn from_matches(matches: &ArgMatches, config: Option<&AcliConfig>) -> Result<Self> {
         let mut server_vars = parse_json_string_map(
             std::env::var(ENV_SERVER_VARS).ok().as_deref(),
             ENV_SERVER_VARS,
         )?;
+        if let Some(config) = config {
+            server_vars.extend(config.server.vars.clone());
+        }
         for (key, value) in parse_pairs(matches.get_many::<String>("server_var"))? {
             server_vars.insert(key, value);
         }
-        let default_headers = parse_json_string_map(
+        let mut default_headers = parse_json_string_map(
             std::env::var(ENV_DEFAULT_HEADERS).ok().as_deref(),
             ENV_DEFAULT_HEADERS,
         )?;
+        if let Some(config) = config {
+            default_headers.extend(config.http.default_headers.clone());
+        }
 
         let mut auth_overrides = BTreeMap::new();
+        if let Some(config) = config {
+            for (scheme, secret) in &config.auth.named {
+                if let Some(value) = secret.resolve_runtime_value() {
+                    auth_overrides.insert(scheme.clone(), value);
+                }
+            }
+        }
         for (key, value) in parse_pairs(matches.get_many::<String>("auth"))? {
             auth_overrides.insert(key, value);
         }
 
-        let insecure = matches.get_flag("insecure") || env_truthy(ENV_INSECURE);
+        let insecure = cli_bool(matches, "insecure")
+            || config
+                .and_then(|config| config.http.insecure)
+                .unwrap_or_else(|| env_truthy(ENV_INSECURE));
 
         Ok(Self {
-            server_url: matches.get_one::<String>("server_url").cloned(),
-            server_index: *matches.get_one::<usize>("server_index").unwrap_or(&0),
+            server_url: cli_string(matches, "server_url")
+                .or_else(|| config.and_then(|config| config.server.url.clone()))
+                .or_else(|| matches.get_one::<String>("server_url").cloned()),
+            server_index: cli_usize(matches, "server_index")
+                .or_else(|| config.and_then(|config| config.server.index))
+                .or_else(|| matches.get_one::<usize>("server_index").copied())
+                .unwrap_or(0),
             server_vars,
             default_headers,
-            bearer_token: matches.get_one::<String>("bearer_token").cloned(),
-            basic_user: matches.get_one::<String>("basic_user").cloned(),
-            basic_pass: matches.get_one::<String>("basic_pass").cloned(),
-            api_key: matches.get_one::<String>("api_key").cloned(),
+            bearer_token: cli_string(matches, "bearer_token")
+                .or_else(|| config.and_then(|config| resolve_secret(&config.auth.bearer_token)))
+                .or_else(|| matches.get_one::<String>("bearer_token").cloned()),
+            basic_user: cli_string(matches, "basic_user")
+                .or_else(|| config.and_then(|config| resolve_secret(&config.auth.basic_user)))
+                .or_else(|| matches.get_one::<String>("basic_user").cloned()),
+            basic_pass: cli_string(matches, "basic_pass")
+                .or_else(|| config.and_then(|config| resolve_secret(&config.auth.basic_pass)))
+                .or_else(|| matches.get_one::<String>("basic_pass").cloned()),
+            api_key: cli_string(matches, "api_key")
+                .or_else(|| config.and_then(|config| resolve_secret(&config.auth.api_key)))
+                .or_else(|| matches.get_one::<String>("api_key").cloned()),
             auth_overrides,
-            timeout_secs: *matches.get_one::<u64>("timeout_secs").unwrap_or(&30),
+            timeout_secs: cli_u64(matches, "timeout_secs")
+                .or_else(|| config.and_then(|config| config.http.timeout_secs))
+                .or_else(|| matches.get_one::<u64>("timeout_secs").copied())
+                .unwrap_or(30),
             insecure,
             verbose: matches.get_flag("verbose"),
             raw_output: matches.get_flag("raw_output"),
             output: matches.get_one::<String>("output").cloned(),
         })
     }
+}
+
+fn resolve_secret(secret: &Option<SecretConfig>) -> Option<String> {
+    secret
+        .as_ref()
+        .and_then(SecretConfig::resolve_runtime_value)
+}
+
+fn cli_string(matches: &ArgMatches, id: &str) -> Option<String> {
+    (matches.value_source(id) == Some(ValueSource::CommandLine))
+        .then(|| matches.get_one::<String>(id).cloned())
+        .flatten()
+}
+
+fn cli_u64(matches: &ArgMatches, id: &str) -> Option<u64> {
+    (matches.value_source(id) == Some(ValueSource::CommandLine))
+        .then(|| matches.get_one::<u64>(id).copied())
+        .flatten()
+}
+
+fn cli_usize(matches: &ArgMatches, id: &str) -> Option<usize> {
+    (matches.value_source(id) == Some(ValueSource::CommandLine))
+        .then(|| matches.get_one::<usize>(id).copied())
+        .flatten()
+}
+
+fn cli_bool(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine) && matches.get_flag(id)
 }
 
 #[derive(Debug)]
@@ -1164,11 +1228,10 @@ fn base64_encode(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ENV_API_KEY;
     use crate::spec::ParameterSpec;
+    use clap::{Arg, ArgAction};
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarGuard {
         name: String,
@@ -1453,7 +1516,7 @@ mod tests {
 
     #[test]
     fn parse_json_string_map_expands_env_templates() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         let _api_key = EnvVarGuard::set("API_KEY", Some("runtime-secret"));
 
         let headers = parse_json_string_map(
@@ -1474,7 +1537,7 @@ mod tests {
 
     #[test]
     fn parse_json_string_map_errors_for_missing_env_templates() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         let _api_key = EnvVarGuard::set("API_KEY", None);
 
         let error = parse_json_string_map(
@@ -1491,12 +1554,115 @@ mod tests {
 
     #[test]
     fn named_auth_override_uses_acli_prefix() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = crate::ENV_LOCK.lock().unwrap();
         let _new_prefix = EnvVarGuard::set("ACLI_AUTH_CUSTOM_HEADER", Some("secret"));
 
         assert_eq!(
             env_auth_override("custom-header").as_deref(),
             Some("secret")
+        );
+    }
+
+    #[test]
+    fn config_overrides_env_and_cli_overrides_config_for_runtime_options() {
+        let _lock = crate::ENV_LOCK.lock().unwrap();
+        let _base = EnvVarGuard::set(ENV_BASE_URL, Some("https://env.example.test"));
+        let _headers = EnvVarGuard::set(ENV_DEFAULT_HEADERS, Some(r#"{"X-Mode":"env"}"#));
+        let _timeout = EnvVarGuard::set("ACLI_TIMEOUT_SECS", Some("5"));
+
+        let config = crate::app_config::parse_config_json(
+            r#"{
+              "version": 1,
+              "spec": "openapi.json",
+              "server": {
+                "url": "https://config.example.test",
+                "index": 3,
+                "vars": {"region": "config"}
+              },
+              "http": {
+                "timeoutSecs": 45,
+                "defaultHeaders": {"X-Mode": "config"}
+              },
+              "auth": {
+                "apiKey": {"value": "config-key"},
+                "named": {"partner": {"value": "config-partner"}}
+              }
+            }"#,
+        )
+        .expect("config");
+
+        let matches = Command::new("test")
+            .arg(Arg::new("server_url").long("server-url").env(ENV_BASE_URL))
+            .arg(
+                Arg::new("server_index")
+                    .long("server-index")
+                    .value_parser(clap::value_parser!(usize))
+                    .default_value("0"),
+            )
+            .arg(
+                Arg::new("server_var")
+                    .long("server-var")
+                    .action(ArgAction::Append),
+            )
+            .arg(Arg::new("api_key").long("api-key").env(ENV_API_KEY))
+            .arg(Arg::new("auth").long("auth").action(ArgAction::Append))
+            .arg(
+                Arg::new("timeout_secs")
+                    .long("timeout")
+                    .value_parser(clap::value_parser!(u64))
+                    .env("ACLI_TIMEOUT_SECS")
+                    .default_value("30"),
+            )
+            .arg(
+                Arg::new("insecure")
+                    .long("insecure")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(Arg::new("bearer_token").long("bearer-token"))
+            .arg(Arg::new("basic_user").long("basic-user"))
+            .arg(Arg::new("basic_pass").long("basic-pass"))
+            .arg(
+                Arg::new("verbose")
+                    .long("verbose")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("raw_output")
+                    .long("raw")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(Arg::new("output").long("output"))
+            .try_get_matches_from([
+                "test",
+                "--server-url",
+                "https://cli.example.test",
+                "--server-var",
+                "region=cli",
+                "--auth",
+                "partner=cli-partner",
+            ])
+            .expect("matches");
+
+        let runtime = RuntimeOptions::from_matches(&matches, Some(&config)).expect("runtime");
+
+        assert_eq!(
+            runtime.server_url.as_deref(),
+            Some("https://cli.example.test")
+        );
+        assert_eq!(runtime.server_index, 3);
+        assert_eq!(
+            runtime.server_vars.get("region").map(String::as_str),
+            Some("cli")
+        );
+        assert_eq!(
+            runtime.default_headers.get("X-Mode").map(String::as_str),
+            Some("config")
+        );
+        assert_eq!(runtime.timeout_secs, 45);
+        assert_eq!(runtime.api_key.as_deref(), Some("config-key"));
+        assert_eq!(
+            runtime.auth_overrides.get("partner").map(String::as_str),
+            Some("cli-partner")
         );
     }
 }

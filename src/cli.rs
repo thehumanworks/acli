@@ -1,8 +1,8 @@
 use crate::colors::Theme;
 use crate::config::{
     ENV_API_KEY, ENV_BASE_URL, ENV_BASIC_PASS, ENV_BASIC_USER, ENV_BEARER_TOKEN, ENV_COLOR,
-    ENV_COLOR_SCHEME, ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_NO_BANNER, ENV_SERVER_INDEX,
-    ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT, ENV_TITLE,
+    ENV_COLOR_SCHEME, ENV_CONFIG, ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_NO_BANNER,
+    ENV_SERVER_INDEX, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT, ENV_TITLE,
 };
 use crate::spec::{OpenApiSpec, OperationSpec, ParameterSpec, SecurityRequirement};
 use clap::builder::PossibleValuesParser;
@@ -52,6 +52,12 @@ fn global_args() -> Vec<Arg> {
             .env(ENV_SPEC)
             .global(true)
             .help("OpenAPI spec source; accepts an HTTPS URL, a local path, or raw JSON"),
+        Arg::new("config")
+            .long("config")
+            .value_name("PATH|JSON")
+            .env(ENV_CONFIG)
+            .global(true)
+            .help("acli JSON config source; accepts a local path or raw JSON"),
         Arg::new("title")
             .long("title")
             .value_name("TEXT")
@@ -564,7 +570,7 @@ fn long_about(spec: &OpenApiSpec) -> String {
 
 fn root_after_help(bin_name: &str) -> String {
     format!(
-        "Environment:\n  {ENV_SPEC}              OpenAPI spec source (URL, path, or inline JSON)\n  {ENV_TITLE}             Optional ASCII banner title\n  {ENV_COLOR_SCHEME}      Color preset or JSON theme config\n  {ENV_COLOR}             auto|always|never\n  {ENV_NO_BANNER}         Set to true/1 to suppress the banner\n  {ENV_BASE_URL}          Server URL override\n  {ENV_SERVER_INDEX}      Default server index (integer)\n  {ENV_SERVER_VARS}       JSON object for server variable overrides\n  {ENV_DEFAULT_HEADERS}  JSON object of headers sent with every request; values may use {{{{.ENV_VAR}}}} templates\n  {ENV_BEARER_TOKEN}      Default bearer token\n  {ENV_BASIC_USER}        Default basic auth username\n  {ENV_BASIC_PASS}        Default basic auth password\n  {ENV_API_KEY}           Default api key fallback\n\nLock workflow (pin spec + build/install API-specific CLI):\n  {bin_name} lock --output ./my-api-cli --spec <URL|PATH> [--secrets keychain|inline|env]\n  {bin_name} lock --output ./my-api-cli --spec <URL|PATH> --secrets env --api-key-env HOST_API_KEY\n  Pass --no-install to only generate the crate.\n\nCommon workflow:\n  {bin_name} list\n  {bin_name} describe <operation>\n  {bin_name} <operation> [generated flags] [--query name=value] [--body-file payload.json]"
+        "Environment:\n  {ENV_CONFIG}            acli JSON config source (path or inline JSON)\n  {ENV_SPEC}              OpenAPI spec source (URL, path, or inline JSON)\n  {ENV_TITLE}             Optional ASCII banner title\n  {ENV_COLOR_SCHEME}      Color preset or JSON theme config\n  {ENV_COLOR}             auto|always|never\n  {ENV_NO_BANNER}         Set to true/1 to suppress the banner\n  {ENV_BASE_URL}          Server URL override\n  {ENV_SERVER_INDEX}      Default server index (integer)\n  {ENV_SERVER_VARS}       JSON object for server variable overrides\n  {ENV_DEFAULT_HEADERS}  JSON object of headers sent with every request; values may use {{{{.ENV_VAR}}}} templates\n  {ENV_BEARER_TOKEN}      Default bearer token\n  {ENV_BASIC_USER}        Default basic auth username\n  {ENV_BASIC_PASS}        Default basic auth password\n  {ENV_API_KEY}           Default api key fallback\n\nInstall workflow (pin spec + install API-specific CLI launcher, no Rust toolchain required):\n  {bin_name} schema > acli.schema.json\n  {bin_name} install --config ./acli.json\n  {bin_name} install --output ./my-api-cli --spec <URL|PATH> [--secrets keychain|inline|env]\n  {bin_name} install --output ./my-api-cli --spec <URL|PATH> --secrets env --api-key-env HOST_API_KEY\n  {bin_name} uninstall my_api_cli\n  Pass --no-install to only write the lock bundle.\n\nCommon workflow:\n  {bin_name} --config ./acli.json list\n  {bin_name} list\n  {bin_name} describe <operation>\n  {bin_name} <operation> [generated flags] [--query name=value] [--body-file payload.json]"
     )
 }
 

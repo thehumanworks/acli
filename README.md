@@ -8,6 +8,7 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
   - `https://...` URL
   - local file path
   - raw inline JSON string
+- Accepts an acli JSON config from `ACLI_CONFIG` or `--config`
 - Builds one subcommand per operation
 - Generates help screens from the spec metadata
 - Supports path, query, header, and cookie parameters
@@ -25,6 +26,7 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
 ## Environment variables
 
 - `ACLI_SPEC` — required unless `--spec` is passed
+- `ACLI_CONFIG` — optional acli JSON config path or inline JSON object
 - `ACLI_TITLE` — optional ASCII banner title
 - `ACLI_COLOR_SCHEME` — optional preset (`default|mono|ocean|sunset`) or JSON object
 - `ACLI_COLOR` — `auto|always|never`
@@ -37,7 +39,49 @@ Application Command Line Interface: a Rust CLI that loads an OpenAPI JSON docume
 - `ACLI_API_KEY`
 - `ACLI_TIMEOUT_SECS`
 - `ACLI_INSECURE`
+- `ACLI_DATA_DIR` — app-owned data directory for installed lock bundles
+- `ACLI_INSTALL_ROOT` — install root whose `bin` directory receives locked CLI launchers
 - `ACLI_AUTH_<SCHEME_NAME>` — named auth override, where non-alphanumeric characters are converted to `_` and the name is uppercased
+
+## JSON config
+
+Use `acli schema` to generate a JSON Schema for editor completion and validation:
+
+```bash
+cargo run -- schema > acli.schema.json
+```
+
+Then point your config at the schema:
+
+```json
+{
+  "$schema": "./acli.schema.json",
+  "version": 1,
+  "spec": "https://petstore3.swagger.io/api/v3/openapi.json",
+  "cli": {
+    "binaryName": "petstore_cli",
+    "title": "Petstore",
+    "colorScheme": "ocean"
+  },
+  "http": {
+    "defaultHeaders": {
+      "X-API-Key": "{{.PETSTORE_API_KEY}}"
+    },
+    "timeoutSecs": 30
+  },
+  "install": {
+    "output": "./petstore-cli",
+    "secrets": "env"
+  }
+}
+```
+
+Config values sit between environment variables and explicit flags: flags win over JSON config, and JSON config wins over environment variables for non-secret runtime and install options.
+
+```bash
+cargo run -- --config ./acli.json list
+cargo run -- install --config ./acli.json
+```
 
 ## Example theme JSON
 
@@ -70,26 +114,37 @@ cargo run -- completions zsh > _acli
 
 ## Locked CLIs
 
-`acli lock` generates an API-specific crate, embeds the pinned spec and lock manifest into the compiled binary, then runs Cargo to build and install the CLI:
+`acli install` creates an API-specific lock bundle and installs a launcher named after the API. The launcher is a copy of the current `acli` runtime, so installing or uninstalling a locked CLI does not require Cargo, rustc, or a host Rust toolchain.
 
 ```bash
-cargo run -- lock \
+cargo run -- install \
   --output ./petstore-cli \
   --spec https://petstore3.swagger.io/api/v3/openapi.json
 
 petstore_cli list
 ```
 
-The install step uses `cargo install --path <output> --force`, so it requires a Rust toolchain with Cargo and rustc available. `acli` does not ship Cargo or rustc; install Rust with rustup or pass `--cargo <PATH>` if Cargo is not on `PATH`. To install somewhere other than Cargo's default user bin directory, pass `--install-root <DIR>`. To only generate the crate without building or installing, pass `--no-install`.
+The generated lock bundle contains `openapi.json` and `acli.lock.json`. During install, `acli` copies that bundle into an app-owned data directory under `locks/<binary-name>` and installs a launcher into `<install-root>/bin`.
 
-The generated crate does not use `build.rs` for installation. Cargo build scripts are designed for build-time code generation and metadata, not cross-platform installation into a user's executable path; `cargo install` is the portable Rust-native build and install mechanism.
+Defaults:
+
+- Data directory: `ACLI_DATA_DIR` when set; otherwise the platform app-data location (`~/Library/Application Support/acli` on macOS, `$XDG_DATA_HOME/acli` or `~/.local/share/acli` on Linux, `%LOCALAPPDATA%\acli` on Windows)
+- Install root: `ACLI_INSTALL_ROOT` when set; otherwise `~/.local` on macOS/Linux and `%LOCALAPPDATA%\acli` on Windows
+
+Use `--data-dir <DIR>` or `--install-root <DIR>` to override those locations. By default, launchers are installed into a user-writable bin directory such as `~/.local/bin`. To only write the lock bundle without installing the launcher, pass `--no-install`.
+
+To uninstall a locked CLI and its app-owned lock bundle, no Rust toolchain is needed:
+
+```bash
+cargo run -- uninstall petstore_cli
+```
 
 ## Locked CLI secret references
 
-`acli lock` can generate an API-specific crate without storing secret values. Use `--secrets env` and pass the host environment variable names to resolve when the generated tool starts:
+`acli install` can install an API-specific CLI without storing secret values. Use `--secrets env` and pass the host environment variable names to resolve when the generated tool starts:
 
 ```bash
-cargo run -- lock \
+cargo run -- install \
   --output ./petstore-cli \
   --spec https://petstore3.swagger.io/api/v3/openapi.json \
   --secrets env \
@@ -139,3 +194,4 @@ acli <operation> [generated parameter flags] [--query name=value] [--body-file p
 - `src/execute.rs` — request assembly, auth resolution, invocation, and rendering
 - `src/colors.rs` — color presets, JSON theme overrides, and clap styles
 - `src/config.rs` — env var names and bootstrap parsing
+- `src/app_config.rs` — typed JSON config parsing and JSON Schema generation
