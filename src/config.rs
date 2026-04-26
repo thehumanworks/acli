@@ -253,6 +253,42 @@ Examples:
     )
 }
 
+pub fn schema_help(bin_name: &str) -> String {
+    format!(
+        r#"{bin_name} schema
+
+Print the JSON Schema for acli config files to stdout.
+
+Usage:
+  {bin_name} schema
+  {bin_name} schema --help
+
+Editor workflow:
+  {bin_name} schema > acli.schema.json
+
+Then add the schema to each config file:
+  {{
+    "$schema": "./acli.schema.json",
+    "version": 1,
+    "spec": "https://example.com/openapi.json"
+  }}
+
+Cursor and VS Code can also map config filenames from .vscode/settings.json:
+  {{
+    "json.schemas": [
+      {{
+        "fileMatch": ["/acli.json", "/*.acli.json"],
+        "url": "./acli.schema.json"
+      }}
+    ]
+  }}
+
+Neovim users can map the same schema through jsonls with fileMatch values such as
+`acli.json` and `*.acli.json`.
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

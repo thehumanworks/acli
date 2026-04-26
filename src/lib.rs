@@ -9,7 +9,7 @@ pub mod spec;
 use crate::app_config::config_schema_json;
 use crate::cli::build_command;
 use crate::colors::Theme;
-use crate::config::{bootstrap_help, BootstrapConfig, ENV_SPEC};
+use crate::config::{bootstrap_help, schema_help, BootstrapConfig, ENV_SPEC};
 use crate::execute::run as run_commands;
 use crate::lock::{
     launcher_lock_dir, run_install_command, run_uninstall_command, InstallCli, UninstallCli,
@@ -122,7 +122,11 @@ pub fn run() -> Result<()> {
     if let Some(lock_dir) = launcher_lock_dir()? {
         return run_locked(&lock_dir);
     }
-    if find_bootstrap_subcommand(&args, "schema").is_some() {
+    if let Some(schema_idx) = find_bootstrap_subcommand(&args, "schema") {
+        if schema_wants_help(&args, schema_idx) {
+            println!("{}", schema_help(&executable_name(&args)));
+            return Ok(());
+        }
         println!("{}", config_schema_json()?);
         return Ok(());
     }
@@ -229,6 +233,12 @@ fn subcommand_only_argv(args: &[String], command_idx: usize) -> Vec<String> {
     out
 }
 
+fn schema_wants_help(args: &[String], schema_idx: usize) -> bool {
+    args[schema_idx + 1..]
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help"))
+}
+
 #[cfg(test)]
 mod lock_bootstrap_tests {
     use super::*;
@@ -277,6 +287,15 @@ mod lock_bootstrap_tests {
             "schema".into(),
         ];
         assert_eq!(find_bootstrap_subcommand(&args, "schema"), Some(3));
+    }
+
+    #[test]
+    fn schema_help_is_detected_after_schema_command() {
+        let args = vec!["acli".into(), "schema".into(), "--help".into()];
+        assert!(schema_wants_help(&args, 1));
+
+        let args = vec!["acli".into(), "--help".into(), "schema".into()];
+        assert!(!schema_wants_help(&args, 2));
     }
 
     #[test]

@@ -83,6 +83,44 @@ cargo run -- --config ./acli.json list
 cargo run -- install --config ./acli.json
 ```
 
+### Editor schema discovery
+
+The most portable setup is to keep `acli.schema.json` next to `acli.json` and include `$schema` in the config file. This works in Cursor, VS Code, and Neovim setups that use a JSON language server.
+
+For repo-wide discovery in Cursor and VS Code, add `.vscode/settings.json`:
+
+```json
+{
+  "json.schemas": [
+    {
+      "fileMatch": [
+        "/acli.json",
+        "/*.acli.json"
+      ],
+      "url": "./acli.schema.json"
+    }
+  ]
+}
+```
+
+For Neovim with `jsonls`, map the same schema in LSP settings:
+
+```lua
+require("lspconfig").jsonls.setup({
+  settings = {
+    json = {
+      schemas = {
+        {
+          fileMatch = { "acli.json", "*.acli.json" },
+          url = "./acli.schema.json",
+        },
+      },
+      validate = { enable = true },
+    },
+  },
+})
+```
+
 ## Example theme JSON
 
 ```json
