@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Application Command Line Interface runtime for OpenAPI JSON specs loaded from env vars"
 license = "MIT"
+homepage = "https://github.com/thehumanworks/acli"
+repository = "https://github.com/thehumanworks/acli"
+readme = "README.md"
 
 [lib]
 name = "acli"

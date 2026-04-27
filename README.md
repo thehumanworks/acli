@@ -206,14 +206,16 @@ Missing or empty template variables are reported as configuration errors.
 
 ## Binary downloads
 
-Pushes to `main` build Linux, macOS, and Windows binaries with GitHub Actions. Download the latest main-branch artifacts from the `Build binaries` workflow run.
+Pushes to `main` publish a tagged GitHub prerelease with downloadable binaries and SHA-256 checksum files. The generated tag format is `main-v<package-version>-<12-char-commit>`, so each main-branch build has a stable release page and immutable assets.
 
-Version tags that start with `v` also publish archives and SHA-256 checksum files to GitHub Releases:
+Version tags that start with `v` still publish stable release archives and checksum files.
 
 - `acli-linux-x86_64.tar.gz`
+- `acli-linux-arm64.tar.gz`
 - `acli-macos-x86_64.tar.gz`
-- `acli-macos-aarch64.tar.gz`
+- `acli-macos-arm64.tar.gz`
 - `acli-windows-x86_64.zip`
+- `acli-windows-arm64.zip`
 
 ## Generated command shape
 
