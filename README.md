@@ -61,7 +61,10 @@ Then point your config at the schema:
   "cli": {
     "binaryName": "petstore_cli",
     "title": "Petstore",
-    "colorScheme": "ocean"
+    "colorScheme": "ocean",
+    "operationNames": {
+      "listPets": "pets-list"
+    }
   },
   "http": {
     "defaultHeaders": {
@@ -82,6 +85,25 @@ Config values sit between environment variables and explicit flags: flags win ov
 cargo run -- --config ./acli.json list
 cargo run -- install --config ./acli.json
 ```
+
+### Operation command remapping
+
+Use `cli.operationNames` to map OpenAPI `operationId` values to clearer command names:
+
+```json
+{
+  "version": 1,
+  "spec": "./openapi.json",
+  "cli": {
+    "operationNames": {
+      "createInternalBillingCustomer": "create-customer",
+      "listAllCustomerInvoices": "list-invoices"
+    }
+  }
+}
+```
+
+The map keys must match the original `operationId` values exactly. The configured command names are slugified into single CLI command tokens, must stay unique across the API, and cannot shadow built-in commands such as `list` or `describe`. Installed locked CLIs persist the same remap in `acli.lock.json`, so the renamed commands still work after installation.
 
 ### Editor schema discovery
 
