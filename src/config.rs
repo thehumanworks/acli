@@ -234,6 +234,7 @@ Install (no spec loaded yet for this subcommand):
   {bin_name} install --config ./acli.json
   {bin_name} install --output ./my-api-cli --spec <URL|PATH|JSON> [--secrets keychain|inline|env]
   {bin_name} install --output ./my-api-cli --spec <URL|PATH|JSON> --secrets env --api-key-env HOST_API_KEY
+    Config files may remap OpenAPI operationId values with cli.operationNames; installed locked CLIs keep those command names.
   By default this copies the current {bin_name} runtime into the install root and stores the lock bundle under {ENV_DATA_DIR}; no Rust toolchain is needed.
   Pass --no-install to only write the lock bundle.
 
@@ -270,7 +271,12 @@ Then add the schema to each config file:
   {{
     "$schema": "./acli.schema.json",
     "version": 1,
-    "spec": "https://example.com/openapi.json"
+        "spec": "https://example.com/openapi.json",
+        "cli": {{
+            "operationNames": {{
+                "listPets": "pets-list"
+            }}
+        }}
   }}
 
 Cursor and VS Code can also map config filenames from .vscode/settings.json:

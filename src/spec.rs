@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Client;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -233,6 +233,79 @@ impl OpenApiSpec {
                 || operation.slug == normalized
                 || operation.operation_id.as_deref() == Some(name)
         })
+    }
+
+    pub fn apply_operation_name_overrides(
+        &mut self,
+        overrides: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        if overrides.is_empty() {
+            return Ok(());
+        }
+
+        let known_operation_ids = self
+            .operations
+            .iter()
+            .filter_map(|operation| operation.operation_id.as_ref())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unknown = overrides
+            .keys()
+            .filter(|operation_id| !known_operation_ids.contains(*operation_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            bail!(
+                "cli.operationNames references unknown operationId values: {}",
+                unknown.join(", ")
+            );
+        }
+
+        let mut slug_to_operation = BTreeMap::<String, String>::new();
+        let mut final_slugs = Vec::with_capacity(self.operations.len());
+
+        for operation in &self.operations {
+            let remapped_slug = match operation
+                .operation_id
+                .as_ref()
+                .and_then(|operation_id| overrides.get(operation_id))
+            {
+                Some(name) => {
+                    let slug = slugify(name);
+                    if RESERVED_ROOT_COMMANDS.contains(&slug.as_str()) {
+                        bail!(
+                            "cli.operationNames maps operationId '{}' to reserved CLI command '{}'",
+                            operation.operation_id.as_deref().unwrap_or("<unknown>"),
+                            slug
+                        );
+                    }
+                    slug
+                }
+                None => operation.slug.clone(),
+            };
+
+            let operation_label = operation
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| operation.slug.clone());
+            if let Some(existing) = slug_to_operation.insert(remapped_slug.clone(), operation_label.clone()) {
+                bail!(
+                    "cli.operationNames produces duplicate CLI command '{}' for operations '{}' and '{}'",
+                    remapped_slug,
+                    existing,
+                    operation_label
+                );
+            }
+
+            final_slugs.push(remapped_slug);
+        }
+
+        for (operation, slug) in self.operations.iter_mut().zip(final_slugs) {
+            operation.slug = slug;
+        }
+        self.operations.sort_by(|left, right| left.slug.cmp(&right.slug));
+
+        Ok(())
     }
 
     fn parse_operations(&self) -> Result<Vec<OperationSpec>> {
@@ -727,6 +800,16 @@ impl OpenApiSpec {
     }
 }
 
+const RESERVED_ROOT_COMMANDS: &[&str] = &[
+    "completions",
+    "describe",
+    "help",
+    "install",
+    "list",
+    "schema",
+    "uninstall",
+];
+
 fn infer_schema_type(obj: &Map<String, Value>) -> Option<String> {
     if obj.contains_key("properties") {
         Some("object".to_string())
@@ -888,12 +971,74 @@ fn value_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
 
+        fn operation_id_openapi_json() -> &'static str {
+                r##"{
+                    "openapi": "3.0.3",
+                    "info": {"title": "x", "version": "1"},
+                    "paths": {
+                        "/pets": {
+                            "get": {
+                                "operationId": "listPets",
+                                "responses": {"200": {"description": "ok"}}
+                            },
+                            "post": {
+                                "operationId": "createPet",
+                                "responses": {"201": {"description": "created"}}
+                            }
+                        }
+                    }
+                }"##
+        }
+
     #[test]
     fn slugify_is_stable() {
         assert_eq!(slugify("ListPets"), "list-pets");
         assert_eq!(slugify("list pets"), "list-pets");
         assert_eq!(slugify("GET /pets/{id}"), "get-pets-id");
     }
+
+        #[test]
+        fn applies_operation_name_overrides() {
+                let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+                let overrides = BTreeMap::from([("listPets".to_string(), "pets list".to_string())]);
+
+                spec.apply_operation_name_overrides(&overrides).unwrap();
+
+                let operation = spec.find_operation("pets-list").expect("remapped op");
+                assert_eq!(operation.operation_id.as_deref(), Some("listPets"));
+                assert_eq!(operation.slug, "pets-list");
+                assert_eq!(spec.find_operation("listPets").unwrap().slug, "pets-list");
+        }
+
+        #[test]
+        fn rejects_unknown_operation_name_override() {
+                let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+                let overrides = BTreeMap::from([("missingOperation".to_string(), "pets-list".to_string())]);
+
+                let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
+
+                assert!(error.to_string().contains("unknown operationId"));
+        }
+
+        #[test]
+        fn rejects_reserved_operation_name_override() {
+                let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+                let overrides = BTreeMap::from([("listPets".to_string(), "list".to_string())]);
+
+                let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
+
+                assert!(error.to_string().contains("reserved CLI command"));
+        }
+
+        #[test]
+        fn rejects_operation_name_override_that_collides_with_existing_slug() {
+            let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+            let overrides = BTreeMap::from([("listPets".to_string(), "create pet".to_string())]);
+
+            let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
+
+            assert!(error.to_string().contains("duplicate CLI command 'create-pet'"));
+        }
 
     #[test]
     fn resolves_local_parameter_refs() {

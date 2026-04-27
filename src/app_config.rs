@@ -48,6 +48,9 @@ pub struct CliConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Suppress ASCII banner rendering.")]
     pub no_banner: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(description = "Map original OpenAPI operationId values to custom CLI command names.")]
+    pub operation_names: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -248,7 +251,10 @@ mod tests {
                 "title": "Petstore",
                 "colorScheme": "ocean",
                 "color": "never",
-                "noBanner": true
+                                "noBanner": true,
+                                "operationNames": {
+                                    "listPets": "pets-list"
+                                }
               },
               "server": {
                 "url": "https://api.example.test",
@@ -277,6 +283,10 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.cli.binary_name.as_deref(), Some("petstore_cli"));
+        assert_eq!(
+            config.cli.operation_names.get("listPets").map(String::as_str),
+            Some("pets-list")
+        );
         assert_eq!(config.server.index, Some(2));
         assert_eq!(config.http.timeout_secs, Some(45));
         assert_eq!(
@@ -313,6 +323,7 @@ mod tests {
         assert!(value.get("properties").is_some());
         assert!(schema.contains("\"spec\""));
         assert!(schema.contains("\"binaryName\""));
+        assert!(schema.contains("\"operationNames\""));
         assert!(schema.contains("\"defaultHeaders\""));
         assert!(schema.contains("\"secrets\""));
     }

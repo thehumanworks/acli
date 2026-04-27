@@ -7,7 +7,7 @@ use crate::config::{
     ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_INSTALL_ROOT, ENV_LOCK_DIR, ENV_NO_BANNER,
     ENV_SERVER_INDEX, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT, ENV_TITLE,
 };
-use crate::spec::load_spec_text;
+use crate::spec::{load_spec_text, OpenApiSpec};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use keyring::{Entry, Error as KeyringError};
@@ -179,6 +179,8 @@ pub struct LockManifest {
     pub server_vars: BTreeMap<String, String>,
     #[serde(default)]
     pub default_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_names: BTreeMap<String, String>,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     #[serde(default)]
@@ -440,7 +442,13 @@ fn run_install_command_inner(cli: InstallCli) -> Result<()> {
 
     let spec_text = load_spec_text(&spec_source)
         .with_context(|| format!("failed to load OpenAPI spec from '{spec_source}'"))?;
-    let api_title = api_title_from_json(&spec_text)?;
+    let mut parsed_spec = OpenApiSpec::from_json_with_source(&spec_text, Some(&spec_source))
+        .with_context(|| format!("failed to parse OpenAPI spec from '{spec_source}'"))?;
+    let operation_names = config
+        .map(|config| config.cli.operation_names.clone())
+        .unwrap_or_default();
+    parsed_spec.apply_operation_name_overrides(&operation_names)?;
+    let api_title = parsed_spec.info.title.clone().unwrap_or_else(|| "api".to_string());
 
     let binary_name = cli
         .binary_name
@@ -564,6 +572,7 @@ fn run_install_command_inner(cli: InstallCli) -> Result<()> {
             .unwrap_or(0),
         server_vars,
         default_headers,
+        operation_names,
         timeout_secs: cli
             .timeout
             .or_else(|| config.and_then(|config| config.http.timeout_secs))
@@ -956,15 +965,6 @@ fn make_executable(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-fn api_title_from_json(json: &str) -> Result<String> {
-    let v: Value = serde_json::from_str(json).context("failed to parse spec as JSON")?;
-    Ok(v.get("info")
-        .and_then(|i| i.get("title"))
-        .and_then(Value::as_str)
-        .unwrap_or("api")
-        .to_string())
 }
 
 fn slugify_crate_name(title: &str) -> String {
@@ -1388,7 +1388,21 @@ mod tests {
     }
 
     fn minimal_openapi_json() -> String {
-        r#"{"openapi":"3.0.0","info":{"title":"My Service","version":"1"},"paths":{}}"#.to_string()
+                r#"{
+                    "openapi": "3.0.0",
+                    "info": {"title": "My Service", "version": "1"},
+                    "paths": {
+                        "/pets": {
+                            "get": {
+                                "operationId": "listPets",
+                                "responses": {
+                                    "200": {"description": "ok"}
+                                }
+                            }
+                        }
+                    }
+                }"#
+                        .to_string()
     }
 
     #[test]
@@ -1440,6 +1454,7 @@ mod tests {
             server_index: 2,
             server_vars: BTreeMap::from([("host".into(), "api".into())]),
             default_headers: BTreeMap::from([("X-Foo".into(), "bar".into())]),
+            operation_names: BTreeMap::from([("listPets".into(), "pets-list".into())]),
             timeout_secs: 99,
             insecure: true,
             keychain_service: None,
@@ -1459,6 +1474,10 @@ mod tests {
         assert_eq!(
             loaded.server_vars.get("host").map(String::as_str),
             Some("api")
+        );
+        assert_eq!(
+            loaded.operation_names.get("listPets").map(String::as_str),
+            Some("pets-list")
         );
     }
 
@@ -1491,6 +1510,7 @@ mod tests {
             server_index: 2,
             server_vars: BTreeMap::from([("host".into(), "api".into())]),
             default_headers: BTreeMap::from([("X-Foo".into(), "bar".into())]),
+            operation_names: BTreeMap::new(),
             timeout_secs: 99,
             insecure: true,
             keychain_service: None,
@@ -1545,6 +1565,7 @@ mod tests {
             server_index: 0,
             server_vars: BTreeMap::new(),
             default_headers: BTreeMap::new(),
+            operation_names: BTreeMap::new(),
             timeout_secs: 30,
             insecure: false,
             keychain_service: None,
@@ -1646,7 +1667,8 @@ mod tests {
                   "cli": {{
                     "binaryName": "config_service",
                     "title": "Config Title",
-                    "colorScheme": "ocean"
+                                        "colorScheme": "ocean",
+                                        "operationNames": {{"listPets": "pets-list"}}
                   }},
                   "server": {{
                     "url": "https://config.example.test",
@@ -1712,6 +1734,10 @@ mod tests {
             manifest.env_secrets.auth.get("partner").map(String::as_str),
             Some("HOST_PARTNER")
         );
+        assert_eq!(
+            manifest.operation_names.get("listPets").map(String::as_str),
+            Some("pets-list")
+        );
     }
 
     fn write_test_bundle(dir: &Path) {
@@ -1728,6 +1754,7 @@ mod tests {
             server_index: 0,
             server_vars: BTreeMap::new(),
             default_headers: BTreeMap::new(),
+            operation_names: BTreeMap::new(),
             timeout_secs: 30,
             insecure: false,
             keychain_service: None,

@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use clap::error::ErrorKind;
 use clap::Parser;
 use figlet_rs::FIGlet;
+use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 
@@ -29,7 +30,7 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn run_locked(lock_dir: &Path) -> Result<()> {
     let manifest = lock::read_manifest(lock_dir)?;
     manifest.apply_to_env(lock_dir)?;
-    run_cli_inner()
+    run_cli_inner_with_spec_and_operation_names(None, Some(&manifest.operation_names))
 }
 
 /// Run the CLI with an embedded OpenAPI spec and lock manifest (kept for older generated locked binaries).
@@ -43,14 +44,17 @@ pub fn run_locked_embedded(manifest_json: &str, spec_json: &str) -> Result<()> {
         );
     }
     manifest.apply_to_env_with_spec_source("<embedded OpenAPI spec>")?;
-    run_cli_inner_with_spec(Some(spec_json))
+    run_cli_inner_with_spec_and_operation_names(Some(spec_json), Some(&manifest.operation_names))
 }
 
 fn run_cli_inner() -> Result<()> {
-    run_cli_inner_with_spec(None)
+    run_cli_inner_with_spec_and_operation_names(None, None)
 }
 
-fn run_cli_inner_with_spec(locked_spec_text: Option<&str>) -> Result<()> {
+fn run_cli_inner_with_spec_and_operation_names(
+    locked_spec_text: Option<&str>,
+    locked_operation_names: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
     let args = env::args().collect::<Vec<_>>();
     let bootstrap = BootstrapConfig::from_env_and_args(&args)?;
     let bin_name = executable_name(&args);
@@ -79,7 +83,12 @@ fn run_cli_inner_with_spec(locked_spec_text: Option<&str>) -> Result<()> {
         None => load_spec_text(&spec_source)
             .with_context(|| format!("failed to load OpenAPI spec from '{spec_source}'"))?,
     };
-    let spec = OpenApiSpec::from_json_with_source(&spec_text, Some(&spec_source))?;
+    let mut spec = OpenApiSpec::from_json_with_source(&spec_text, Some(&spec_source))?;
+    let operation_names = merged_operation_names(
+        bootstrap.app_config.as_ref(),
+        locked_operation_names,
+    );
+    spec.apply_operation_name_overrides(&operation_names)?;
 
     let command = build_command(&bin_name, &spec, &theme).color(bootstrap.color_mode.clap_choice());
     let matches = match command.clone().try_get_matches_from(args) {
@@ -114,6 +123,17 @@ fn run_cli_inner_with_spec(locked_spec_text: Option<&str>) -> Result<()> {
         bootstrap.app_config.as_ref(),
     )?;
     Ok(())
+}
+
+fn merged_operation_names(
+    app_config: Option<&crate::app_config::AcliConfig>,
+    locked_operation_names: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let mut merged = locked_operation_names.cloned().unwrap_or_default();
+    if let Some(config) = app_config {
+        merged.extend(config.cli.operation_names.clone());
+    }
+    merged
 }
 
 /// Full CLI entry including locked launcher and bootstrap command handling.
@@ -341,9 +361,47 @@ fn executable_name(args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_config::parse_config_json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn executable_name_falls_back_to_app_name() {
         assert_eq!(executable_name(&[]), "acli");
+    }
+
+    #[test]
+    fn config_operation_names_override_locked_manifest_names() {
+        let config = parse_config_json(
+            r#"{
+              "version": 1,
+              "spec": "./openapi.json",
+              "cli": {
+                "operationNames": {
+                  "listPets": "config-pets-list",
+                  "createPet": "config-create-pet"
+                }
+              }
+            }"#,
+        )
+        .expect("config");
+        let locked = BTreeMap::from([
+            ("listPets".to_string(), "locked-pets-list".to_string()),
+            ("deletePet".to_string(), "locked-delete-pet".to_string()),
+        ]);
+
+        let merged = merged_operation_names(Some(&config), Some(&locked));
+
+        assert_eq!(
+            merged.get("listPets").map(String::as_str),
+            Some("config-pets-list")
+        );
+        assert_eq!(
+            merged.get("createPet").map(String::as_str),
+            Some("config-create-pet")
+        );
+        assert_eq!(
+            merged.get("deletePet").map(String::as_str),
+            Some("locked-delete-pet")
+        );
     }
 }

@@ -583,7 +583,35 @@ fn is_alias_safe(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+        use crate::colors::{ColorMode, Theme};
     use clap::error::ErrorKind;
+
+        fn test_theme() -> Theme {
+                Theme::from_env_and_mode(None, ColorMode::Never).expect("theme")
+        }
+
+        fn remapped_spec() -> OpenApiSpec {
+                let json = r##"{
+                    "openapi": "3.0.3",
+                    "info": {"title": "Petstore", "version": "1"},
+                    "paths": {
+                        "/pets": {
+                            "get": {
+                                "operationId": "listPets",
+                                "responses": {"200": {"description": "ok"}}
+                            }
+                        }
+                    }
+                }"##;
+
+                let mut spec = OpenApiSpec::from_json_with_source(json, None).expect("spec");
+                spec.apply_operation_name_overrides(&std::collections::BTreeMap::from([(
+                        "listPets".to_string(),
+                        "pets-list".to_string(),
+                )]))
+                .expect("override");
+                spec
+        }
 
     fn required_parameter(location: &str) -> ParameterSpec {
         ParameterSpec {
@@ -621,5 +649,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn build_command_accepts_remapped_operation_name() {
+        let spec = remapped_spec();
+        let command = build_command("acli", &spec, &test_theme());
+
+        let matches = command
+            .try_get_matches_from(["acli", "pets-list"])
+            .expect("matches");
+
+        assert_eq!(matches.subcommand_name(), Some("pets-list"));
+    }
+
+    #[test]
+    fn build_command_keeps_safe_operation_id_as_alias_after_remap() {
+        let spec = remapped_spec();
+        let command = build_command("acli", &spec, &test_theme());
+
+        let matches = command
+            .try_get_matches_from(["acli", "listPets"])
+            .expect("matches");
+
+        assert_eq!(matches.subcommand_name(), Some("pets-list"));
     }
 }
