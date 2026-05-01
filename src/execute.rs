@@ -5,7 +5,8 @@ use crate::config::{
     ENV_SERVER_VARS,
 };
 use crate::spec::{
-    OpenApiSpec, OperationSpec, SecurityRequirement, SecuritySchemeSpec, ServerSpec,
+    BodyFieldSpec, OpenApiSpec, OperationSpec, SchemaSummary, SecurityRequirement,
+    SecuritySchemeSpec, ServerSpec,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use clap::parser::ValueSource;
@@ -17,7 +18,7 @@ use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE};
 use reqwest::{Method, Url};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -240,6 +241,34 @@ fn describe_operation(spec: &OpenApiSpec, theme: &Theme, matches: &ArgMatches) -
         );
         for media_type in &body.content {
             println!("  - {}", media_type.content_type);
+        }
+        if !body.fields.is_empty() {
+            println!("  fields:");
+            for field in &body.fields {
+                let schema = field
+                    .schema
+                    .as_ref()
+                    .and_then(|schema| schema.type_name.as_deref())
+                    .unwrap_or("value");
+                println!(
+                    "    {} --{} ({}, type={})",
+                    if field.required {
+                        theme.success("*")
+                    } else {
+                        theme.muted("-")
+                    },
+                    field.flag_name,
+                    if field.required {
+                        "required"
+                    } else {
+                        "optional"
+                    },
+                    schema
+                );
+                if let Some(description) = &field.description {
+                    println!("        {}", description);
+                }
+            }
         }
     }
 
@@ -536,8 +565,28 @@ impl InvocationInput {
             .into_iter()
             .map(|(field, path)| (field, PathBuf::from(path)))
             .collect::<Vec<_>>();
+        let generated_body = collect_generated_body(operation, matches)?;
 
-        let body = if !files.is_empty() || !fields.is_empty() {
+        let raw_body_present = matches.value_source("body") == Some(ValueSource::CommandLine);
+        let body_file_present = matches.value_source("body_file") == Some(ValueSource::CommandLine);
+        let body_stdin_present = matches.value_source("body_stdin")
+            == Some(ValueSource::CommandLine)
+            && matches.get_flag("body_stdin");
+        let form_present = !files.is_empty() || !fields.is_empty();
+        let explicit_body_sources = raw_body_present as usize
+            + body_file_present as usize
+            + body_stdin_present as usize
+            + form_present as usize
+            + generated_body.is_some() as usize;
+        if explicit_body_sources > 1 {
+            bail!(
+                "request body sources are mutually exclusive; use only one of --body, --body-file, --body-stdin, --form/--file, or generated --body-* flags"
+            );
+        }
+
+        let body = if let Some(body) = generated_body {
+            BodyInput::Raw(serde_json::to_vec(&body)?)
+        } else if form_present {
             BodyInput::Form { fields, files }
         } else if let Some(body) = matches.get_one::<String>("body") {
             BodyInput::Raw(body.as_bytes().to_vec())
@@ -563,6 +612,206 @@ impl InvocationInput {
             accept: matches.get_one::<String>("accept").cloned(),
             dry_run: matches.get_flag("dry_run"),
         })
+    }
+}
+
+fn collect_generated_body(
+    operation: &OperationSpec,
+    matches: &ArgMatches,
+) -> Result<Option<Value>> {
+    let Some(request_body) = &operation.request_body else {
+        return Ok(None);
+    };
+    if request_body.fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut object = Map::new();
+    let mut any_generated_field = false;
+    for field in &request_body.fields {
+        if let Some(value) = generated_body_field_value(field, matches)? {
+            any_generated_field = true;
+            object.insert(field.name.clone(), value);
+        }
+    }
+
+    if !any_generated_field {
+        return Ok(None);
+    }
+
+    let missing = request_body
+        .fields
+        .iter()
+        .filter(|field| field.required && !object.contains_key(&field.name))
+        .map(|field| format!("--{}", field.flag_name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "missing required request body field(s) for '{}': {}",
+            operation.slug,
+            missing.join(", ")
+        );
+    }
+
+    Ok(Some(Value::Object(object)))
+}
+
+fn generated_body_field_value(
+    field: &BodyFieldSpec,
+    matches: &ArgMatches,
+) -> Result<Option<Value>> {
+    if matches.value_source(&field.arg_id) != Some(ValueSource::CommandLine) {
+        return Ok(None);
+    }
+
+    let value = match body_value_kind(field.schema.as_ref()) {
+        BodyValueKind::Boolean => Value::Bool(
+            *matches
+                .get_one::<bool>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?,
+        ),
+        BodyValueKind::Integer => Value::Number(Number::from(
+            *matches
+                .get_one::<i64>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?,
+        )),
+        BodyValueKind::Number => {
+            let raw = *matches
+                .get_one::<f64>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?;
+            Value::Number(
+                Number::from_f64(raw)
+                    .ok_or_else(|| anyhow!("invalid finite number for --{}", field.flag_name))?,
+            )
+        }
+        BodyValueKind::Array => {
+            let values = matches
+                .get_many::<String>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?
+                .cloned()
+                .collect::<Vec<_>>();
+            parse_array_body_field(field, &values)?
+        }
+        BodyValueKind::Object => {
+            let raw = matches
+                .get_one::<String>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?;
+            let value = serde_json::from_str::<Value>(raw)
+                .with_context(|| format!("--{} expects a JSON object", field.flag_name))?;
+            if !value.is_object() {
+                bail!("--{} expects a JSON object", field.flag_name);
+            }
+            value
+        }
+        BodyValueKind::String => Value::String(
+            matches
+                .get_one::<String>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?
+                .clone(),
+        ),
+        BodyValueKind::Json => {
+            let raw = matches
+                .get_one::<String>(&field.arg_id)
+                .ok_or_else(|| anyhow!("missing value for --{}", field.flag_name))?;
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+        }
+    };
+
+    Ok(Some(value))
+}
+
+fn parse_array_body_field(field: &BodyFieldSpec, values: &[String]) -> Result<Value> {
+    if values.len() == 1 {
+        if let Ok(value) = serde_json::from_str::<Value>(&values[0]) {
+            if value.is_array() {
+                return Ok(value);
+            }
+        }
+    }
+
+    let item_schema = field
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.items.as_deref());
+    let mut items = Vec::new();
+    for raw in values {
+        items.push(parse_array_item(field, item_schema, raw)?);
+    }
+    Ok(Value::Array(items))
+}
+
+fn parse_array_item(
+    field: &BodyFieldSpec,
+    item_schema: Option<&SchemaSummary>,
+    raw: &str,
+) -> Result<Value> {
+    match body_value_kind(item_schema) {
+        BodyValueKind::String => Ok(Value::String(raw.to_string())),
+        BodyValueKind::Boolean => raw
+            .parse::<bool>()
+            .map(Value::Bool)
+            .with_context(|| format!("--{} array item expects a boolean", field.flag_name)),
+        BodyValueKind::Integer => raw
+            .parse::<i64>()
+            .map(|value| Value::Number(Number::from(value)))
+            .with_context(|| format!("--{} array item expects an integer", field.flag_name)),
+        BodyValueKind::Number => {
+            let value = raw
+                .parse::<f64>()
+                .with_context(|| format!("--{} array item expects a number", field.flag_name))?;
+            Ok(Value::Number(Number::from_f64(value).ok_or_else(|| {
+                anyhow!("--{} array item expects a finite number", field.flag_name)
+            })?))
+        }
+        BodyValueKind::Object => {
+            let value = serde_json::from_str::<Value>(raw).with_context(|| {
+                format!("--{} array item expects a JSON object", field.flag_name)
+            })?;
+            if !value.is_object() {
+                bail!("--{} array item expects a JSON object", field.flag_name);
+            }
+            Ok(value)
+        }
+        BodyValueKind::Array | BodyValueKind::Json => {
+            Ok(serde_json::from_str::<Value>(raw)
+                .unwrap_or_else(|_| Value::String(raw.to_string())))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyValueKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Json,
+}
+
+fn body_value_kind(schema: Option<&SchemaSummary>) -> BodyValueKind {
+    let Some(schema) = schema else {
+        return BodyValueKind::Json;
+    };
+    let Some(type_name) = schema.type_name.as_deref() else {
+        return BodyValueKind::Json;
+    };
+    let types = type_name
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "null")
+        .collect::<Vec<_>>();
+
+    match types.as_slice() {
+        ["string"] => BodyValueKind::String,
+        ["integer"] => BodyValueKind::Integer,
+        ["number"] => BodyValueKind::Number,
+        ["boolean"] => BodyValueKind::Boolean,
+        ["array"] => BodyValueKind::Array,
+        ["object"] => BodyValueKind::Object,
+        ["integer", "number"] | ["number", "integer"] => BodyValueKind::Number,
+        _ => BodyValueKind::Json,
     }
 }
 
@@ -694,8 +943,10 @@ fn choose_content_type(operation: &OperationSpec, invocation: &InvocationInput) 
             return Some("multipart/form-data".to_string());
         }
         BodyInput::Raw(_) => {
-            if available.iter().any(|value| value == "application/json") {
-                return Some("application/json".to_string());
+            if let Some(json_content_type) =
+                available.iter().find(|value| is_json_content_type(value))
+            {
+                return Some(json_content_type.clone());
             }
             if available.len() == 1 {
                 return available.first().cloned();
@@ -709,6 +960,16 @@ fn choose_content_type(operation: &OperationSpec, invocation: &InvocationInput) 
     } else {
         None
     }
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
 }
 
 fn build_url(
@@ -1228,8 +1489,9 @@ fn base64_encode(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::colors::{ColorMode, Theme};
     use crate::config::ENV_API_KEY;
-    use crate::spec::ParameterSpec;
+    use crate::spec::{OpenApiSpec, ParameterSpec};
     use clap::{Arg, ArgAction};
     use std::ffi::OsString;
 
@@ -1329,6 +1591,89 @@ mod tests {
             schema: None,
             content_types: Vec::new(),
         }
+    }
+
+    fn body_field_spec() -> OpenApiSpec {
+        OpenApiSpec::from_json_with_source(
+            r##"{
+              "openapi": "3.1.0",
+              "info": {"title": "x", "version": "1"},
+              "servers": [{"url": "https://api.example.com"}],
+              "paths": {
+                "/exec": {
+                  "post": {
+                    "operationId": "exec",
+                    "requestBody": {
+                      "required": true,
+                      "content": {
+                        "application/json": {
+                          "schema": {"$ref": "#/components/schemas/ExecRequest"}
+                        }
+                      }
+                    },
+                    "responses": {"200": {"description": "ok"}}
+                  }
+                }
+              },
+              "components": {
+                "schemas": {
+                  "ExecRequest": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                      "command": {"type": "array", "items": {"type": "string"}},
+                      "timeout": {"type": "integer"},
+                      "pty": {"type": "boolean"},
+                      "env": {"type": "object", "additionalProperties": {"type": "string"}}
+                    }
+                  }
+                }
+              }
+            }"##,
+            None,
+        )
+        .expect("spec")
+    }
+
+    #[test]
+    fn generated_body_flags_build_typed_json_payload() {
+        let spec = body_field_spec();
+        let theme = Theme::from_env_and_mode(None, ColorMode::Never).expect("theme");
+        let command = crate::cli::build_command("acli", &spec, &theme);
+        let matches = command
+            .try_get_matches_from([
+                "acli",
+                "exec",
+                "--body-command",
+                "echo",
+                "--body-command",
+                "hi",
+                "--body-timeout",
+                "5",
+                "--body-pty",
+                "true",
+                "--body-env",
+                r#"{"FOO":"bar"}"#,
+            ])
+            .expect("matches");
+        let (_, sub_matches) = matches.subcommand().expect("subcommand");
+        let operation = spec.find_operation("exec").expect("operation");
+
+        let invocation = InvocationInput::from_matches(operation, sub_matches).expect("invocation");
+        let BodyInput::Raw(bytes) = invocation.body else {
+            panic!("expected generated raw JSON body");
+        };
+        let value = serde_json::from_slice::<Value>(&bytes).expect("json");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "command": ["echo", "hi"],
+                "timeout": 5,
+                "pty": true,
+                "env": {"FOO": "bar"}
+            })
+        );
     }
 
     #[test]

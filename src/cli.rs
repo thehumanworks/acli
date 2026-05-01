@@ -4,7 +4,9 @@ use crate::config::{
     ENV_COLOR_SCHEME, ENV_CONFIG, ENV_DEFAULT_HEADERS, ENV_INSECURE, ENV_NO_BANNER,
     ENV_SERVER_INDEX, ENV_SERVER_VARS, ENV_SPEC, ENV_TIMEOUT, ENV_TITLE,
 };
-use crate::spec::{OpenApiSpec, OperationSpec, ParameterSpec, SecurityRequirement};
+use crate::spec::{
+    BodyFieldSpec, OpenApiSpec, OperationSpec, ParameterSpec, SchemaSummary, SecurityRequirement,
+};
 use clap::builder::PossibleValuesParser;
 use clap::{value_parser, Arg, ArgAction, ArgGroup, Command};
 
@@ -251,6 +253,11 @@ fn operation_command(operation: &OperationSpec) -> Command {
     for parameter in &operation.parameters {
         cmd = cmd.arg(parameter_arg(parameter));
     }
+    if let Some(body) = &operation.request_body {
+        for field in &body.fields {
+            cmd = cmd.arg(body_field_arg(field));
+        }
+    }
 
     cmd = cmd
         .arg(
@@ -333,21 +340,20 @@ fn operation_command(operation: &OperationSpec) -> Command {
         );
 
     if operation.request_body.is_some() {
-        let body_required = operation
-            .request_body
-            .as_ref()
-            .map(|body| body.required)
-            .unwrap_or(false);
+        let body = operation.request_body.as_ref().expect("checked is_some");
+        let mut request_body_args = vec![
+            "body".to_string(),
+            "body_file".to_string(),
+            "body_stdin".to_string(),
+            "form_pairs".to_string(),
+            "file_pairs".to_string(),
+        ];
+        request_body_args.extend(body.fields.iter().map(|field| field.arg_id.clone()));
         cmd = cmd.group(
             ArgGroup::new("request_body_group")
-                .args([
-                    "body",
-                    "body_file",
-                    "body_stdin",
-                    "form_pairs",
-                    "file_pairs",
-                ])
-                .required(body_required),
+                .args(request_body_args)
+                .required(body.required)
+                .multiple(true),
         );
     }
 
@@ -363,6 +369,33 @@ fn parameter_arg(parameter: &ParameterSpec) -> Arg {
         .value_name(value_name)
         .required(parameter.required && parameter.location != "header")
         .help(help)
+}
+
+fn body_field_arg(field: &BodyFieldSpec) -> Arg {
+    let help = body_field_help(field);
+    let value_name = schema_value_name(field.schema.as_ref());
+    let mut arg = Arg::new(field.arg_id.clone())
+        .long(field.flag_name.clone())
+        .value_name(value_name)
+        .help(help);
+
+    match body_value_kind(field.schema.as_ref()) {
+        BodyValueKind::Boolean => {
+            arg = arg.value_parser(value_parser!(bool));
+        }
+        BodyValueKind::Integer => {
+            arg = arg.value_parser(value_parser!(i64));
+        }
+        BodyValueKind::Number => {
+            arg = arg.value_parser(value_parser!(f64));
+        }
+        BodyValueKind::Array => {
+            arg = arg.action(ArgAction::Append);
+        }
+        BodyValueKind::String | BodyValueKind::Object | BodyValueKind::Json => {}
+    }
+
+    arg
 }
 
 fn parameter_help(parameter: &ParameterSpec) -> String {
@@ -400,17 +433,92 @@ fn parameter_help(parameter: &ParameterSpec) -> String {
 }
 
 fn parameter_value_name(parameter: &ParameterSpec) -> &'static str {
-    match parameter
-        .schema
-        .as_ref()
-        .and_then(|schema| schema.type_name.as_deref())
-    {
-        Some("integer") => "INTEGER",
-        Some("number") => "NUMBER",
-        Some("boolean") => "BOOL",
-        Some("array") => "JSON",
-        Some("object") => "JSON",
-        _ => "VALUE",
+    schema_value_name(parameter.schema.as_ref())
+}
+
+fn body_field_help(field: &BodyFieldSpec) -> String {
+    let mut pieces = Vec::new();
+
+    if let Some(description) = &field.description {
+        pieces.push(description.clone());
+    }
+    pieces.push("request body field".to_string());
+    if field.required {
+        pieces.push("required".to_string());
+    }
+    if field.deprecated {
+        pieces.push("deprecated".to_string());
+    }
+    if let Some(schema) = &field.schema {
+        push_schema_help(&mut pieces, schema);
+    }
+
+    pieces.join(" | ")
+}
+
+fn push_schema_help(pieces: &mut Vec<String>, schema: &SchemaSummary) {
+    if let Some(type_name) = &schema.type_name {
+        pieces.push(format!("type: {type_name}"));
+    }
+    if let Some(format) = &schema.format {
+        pieces.push(format!("format: {format}"));
+    }
+    if let Some(items) = &schema.items {
+        if let Some(item_type) = &items.type_name {
+            pieces.push(format!("items: {item_type}"));
+        }
+    }
+    if !schema.enum_values.is_empty() {
+        pieces.push(format!("enum: {}", schema.enum_values.join(", ")));
+    }
+    if let Some(default) = &schema.default {
+        pieces.push(format!("default: {}", default));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyValueKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Array,
+    Object,
+    Json,
+}
+
+fn body_value_kind(schema: Option<&SchemaSummary>) -> BodyValueKind {
+    let Some(schema) = schema else {
+        return BodyValueKind::Json;
+    };
+    let Some(type_name) = schema.type_name.as_deref() else {
+        return BodyValueKind::Json;
+    };
+    let types = type_name
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "null")
+        .collect::<Vec<_>>();
+
+    match types.as_slice() {
+        ["string"] => BodyValueKind::String,
+        ["integer"] => BodyValueKind::Integer,
+        ["number"] => BodyValueKind::Number,
+        ["boolean"] => BodyValueKind::Boolean,
+        ["array"] => BodyValueKind::Array,
+        ["object"] => BodyValueKind::Object,
+        ["integer", "number"] | ["number", "integer"] => BodyValueKind::Number,
+        _ => BodyValueKind::Json,
+    }
+}
+
+fn schema_value_name(schema: Option<&SchemaSummary>) -> &'static str {
+    match body_value_kind(schema) {
+        BodyValueKind::Integer => "INTEGER",
+        BodyValueKind::Number => "NUMBER",
+        BodyValueKind::Boolean => "BOOL",
+        BodyValueKind::Array | BodyValueKind::Object | BodyValueKind::Json => "JSON",
+        BodyValueKind::String => "VALUE",
     }
 }
 
@@ -463,6 +571,20 @@ fn operation_long_about(operation: &OperationSpec) -> String {
         for media_type in &body.content {
             lines.push(format!("  - {}", media_type.content_type));
         }
+        if !body.fields.is_empty() {
+            lines.push("body flags:".to_string());
+            for field in &body.fields {
+                lines.push(format!(
+                    "  --{} ({})",
+                    field.flag_name,
+                    if field.required {
+                        "required"
+                    } else {
+                        "optional"
+                    }
+                ));
+            }
+        }
     }
     if !operation.responses.is_empty() {
         lines.push(String::new());
@@ -500,7 +622,20 @@ fn operation_after_help(operation: &OperationSpec) -> String {
     } else {
         examples.push(format!("  {}", operation.slug));
     }
-    if operation.request_body.is_some() {
+    if let Some(body) = &operation.request_body {
+        if let Some(field) = body
+            .fields
+            .iter()
+            .find(|field| field.required)
+            .or_else(|| body.fields.first())
+        {
+            examples.push(format!(
+                "  {} --{} <{}>",
+                operation.slug,
+                field.flag_name,
+                schema_value_name(field.schema.as_ref())
+            ));
+        }
         examples.push(format!("  {} --body-file ./payload.json", operation.slug));
     }
     examples.push(format!("  describe {}", operation.slug));
@@ -583,15 +718,15 @@ fn is_alias_safe(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-        use crate::colors::{ColorMode, Theme};
+    use crate::colors::{ColorMode, Theme};
     use clap::error::ErrorKind;
 
-        fn test_theme() -> Theme {
-                Theme::from_env_and_mode(None, ColorMode::Never).expect("theme")
-        }
+    fn test_theme() -> Theme {
+        Theme::from_env_and_mode(None, ColorMode::Never).expect("theme")
+    }
 
-        fn remapped_spec() -> OpenApiSpec {
-                let json = r##"{
+    fn remapped_spec() -> OpenApiSpec {
+        let json = r##"{
                     "openapi": "3.0.3",
                     "info": {"title": "Petstore", "version": "1"},
                     "paths": {
@@ -604,14 +739,14 @@ mod tests {
                     }
                 }"##;
 
-                let mut spec = OpenApiSpec::from_json_with_source(json, None).expect("spec");
-                spec.apply_operation_name_overrides(&std::collections::BTreeMap::from([(
-                        "listPets".to_string(),
-                        "pets-list".to_string(),
-                )]))
-                .expect("override");
-                spec
-        }
+        let mut spec = OpenApiSpec::from_json_with_source(json, None).expect("spec");
+        spec.apply_operation_name_overrides(&std::collections::BTreeMap::from([(
+            "listPets".to_string(),
+            "pets-list".to_string(),
+        )]))
+        .expect("override");
+        spec
+    }
 
     fn required_parameter(location: &str) -> ParameterSpec {
         ParameterSpec {

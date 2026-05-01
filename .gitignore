@@ -2,12 +2,14 @@
 /target/
 **/*.rs.bk
 
+acli.lock.json
+
 # Cargo and Rust tooling caches
 /.cargo/.package-cache
 /.cargo/.global-cache
 
 whoop-cli
-hevy-cli 
+hevy-cli
 
 # Pixi environments
 .pixi/*

@@ -24,6 +24,18 @@ pub struct SchemaSummary {
     pub enum_values: Vec<String>,
     pub default: Option<Value>,
     pub example: Option<Value>,
+    pub items: Option<Box<SchemaSummary>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BodyFieldSpec {
+    pub name: String,
+    pub flag_name: String,
+    pub arg_id: String,
+    pub required: bool,
+    pub deprecated: bool,
+    pub description: Option<String>,
+    pub schema: Option<SchemaSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +65,7 @@ pub struct RequestBodySpec {
     pub required: bool,
     pub description: Option<String>,
     pub content: Vec<MediaTypeSpec>,
+    pub fields: Vec<BodyFieldSpec>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,7 +301,9 @@ impl OpenApiSpec {
                 .operation_id
                 .clone()
                 .unwrap_or_else(|| operation.slug.clone());
-            if let Some(existing) = slug_to_operation.insert(remapped_slug.clone(), operation_label.clone()) {
+            if let Some(existing) =
+                slug_to_operation.insert(remapped_slug.clone(), operation_label.clone())
+            {
                 bail!(
                     "cli.operationNames produces duplicate CLI command '{}' for operations '{}' and '{}'",
                     remapped_slug,
@@ -303,7 +318,8 @@ impl OpenApiSpec {
         for (operation, slug) in self.operations.iter_mut().zip(final_slugs) {
             operation.slug = slug;
         }
-        self.operations.sort_by(|left, right| left.slug.cmp(&right.slug));
+        self.operations
+            .sort_by(|left, right| left.slug.cmp(&right.slug));
 
         Ok(())
     }
@@ -650,13 +666,22 @@ impl OpenApiSpec {
             .map(ToOwned::to_owned);
 
         let mut content = Vec::new();
+        let mut field_candidates = Vec::<(bool, String, Vec<BodyFieldSpec>)>::new();
         if let Some(items) = obj.get("content").and_then(Value::as_object) {
             for (content_type, value) in items {
                 let media_type = self.resolve_value(value)?;
-                let schema = match media_type.get("schema") {
+                let schema_value = media_type.get("schema");
+                let schema = match schema_value {
                     Some(schema) => self.parse_schema_summary(schema)?,
                     None => None,
                 };
+                if let Some(schema_value) = schema_value {
+                    let fields = self.parse_body_fields(schema_value)?;
+                    let is_json = is_json_content_type(content_type);
+                    if !fields.is_empty() && is_json {
+                        field_candidates.push((is_json, content_type.clone(), fields));
+                    }
+                }
                 let example = media_type
                     .get("example")
                     .cloned()
@@ -681,11 +706,19 @@ impl OpenApiSpec {
             }
         }
         content.sort_by(|left, right| left.content_type.cmp(&right.content_type));
+        field_candidates
+            .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let fields = field_candidates
+            .into_iter()
+            .next()
+            .map(|(_, _, fields)| fields)
+            .unwrap_or_default();
 
         Ok(Some(RequestBodySpec {
             required,
             description,
             content,
+            fields,
         }))
     }
 
@@ -730,29 +763,170 @@ impl OpenApiSpec {
                 enum_values: Vec::new(),
                 default: None,
                 example: None,
+                items: None,
             },
-            Value::Object(ref obj) => SchemaSummary {
-                type_name: obj
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| infer_schema_type(obj)),
-                format: obj
-                    .get("format")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                enum_values: obj
-                    .get("enum")
-                    .and_then(Value::as_array)
-                    .map(|values| values.iter().map(value_to_string).collect())
-                    .unwrap_or_default(),
-                default: obj.get("default").cloned(),
-                example: obj.get("example").cloned(),
-            },
+            Value::Object(ref obj) => self.schema_summary_from_object(obj)?,
             _ => return Ok(None),
         };
 
         Ok(Some(summary))
+    }
+
+    fn schema_summary_from_object(&self, obj: &Map<String, Value>) -> Result<SchemaSummary> {
+        if let Some(composition) = obj
+            .get("anyOf")
+            .or_else(|| obj.get("oneOf"))
+            .and_then(Value::as_array)
+        {
+            let mut type_names = Vec::new();
+            let mut enum_values = Vec::new();
+            let mut item_summary = None;
+            for item in composition {
+                if let Some(summary) = self.parse_schema_summary(item)? {
+                    if let Some(type_name) = summary.type_name {
+                        for part in type_name.split('|') {
+                            let part = part.trim();
+                            if !part.is_empty() && !type_names.iter().any(|seen| seen == part) {
+                                type_names.push(part.to_string());
+                            }
+                        }
+                    }
+                    enum_values.extend(summary.enum_values);
+                    if item_summary.is_none() {
+                        item_summary = summary.items;
+                    }
+                }
+            }
+
+            return Ok(SchemaSummary {
+                type_name: (!type_names.is_empty()).then(|| type_names.join("|")),
+                format: obj
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                enum_values,
+                default: obj.get("default").cloned(),
+                example: obj.get("example").cloned(),
+                items: item_summary,
+            });
+        }
+
+        if let Some(items) = obj.get("allOf").and_then(Value::as_array) {
+            let mut summaries = Vec::new();
+            for item in items {
+                if let Some(summary) = self.parse_schema_summary(item)? {
+                    summaries.push(summary);
+                }
+            }
+            if let Some(mut summary) = summaries.into_iter().next() {
+                summary.default = obj.get("default").cloned().or(summary.default);
+                summary.example = obj.get("example").cloned().or(summary.example);
+                return Ok(summary);
+            }
+        }
+
+        Ok(SchemaSummary {
+            type_name: schema_type_name(obj).or_else(|| infer_schema_type(obj)),
+            format: obj
+                .get("format")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            enum_values: obj
+                .get("enum")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().map(value_to_string).collect())
+                .unwrap_or_default(),
+            default: obj.get("default").cloned(),
+            example: obj.get("example").cloned(),
+            items: match obj.get("items") {
+                Some(items) => self.parse_schema_summary(items)?.map(Box::new),
+                None => None,
+            },
+        })
+    }
+
+    fn parse_body_fields(&self, value: &Value) -> Result<Vec<BodyFieldSpec>> {
+        let resolved = self.resolve_value(value)?;
+        let Some(schema_obj) = self.object_schema(&resolved)? else {
+            return Ok(Vec::new());
+        };
+
+        let required = schema_obj
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let Some(properties) = schema_obj.get("properties").and_then(Value::as_object) else {
+            return Ok(Vec::new());
+        };
+
+        let mut fields = Vec::new();
+        let mut used_flags = HashSet::new();
+        let mut used_ids = HashSet::new();
+        for (name, raw_property) in properties {
+            let property = self.resolve_value(raw_property)?;
+            let property_obj = property.as_object();
+            let deprecated = property_obj
+                .and_then(|obj| obj.get("deprecated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let description = property_obj.and_then(|obj| {
+                obj.get("description")
+                    .and_then(Value::as_str)
+                    .or_else(|| obj.get("title").and_then(Value::as_str))
+                    .map(ToOwned::to_owned)
+            });
+            let schema = self.parse_schema_summary(&property)?;
+            let flag_name = unique_name(format!("body-{}", slugify(name)), &mut used_flags, '-');
+            let arg_id = unique_name(
+                format!("body__{}", sanitize_identifier(name)),
+                &mut used_ids,
+                '_',
+            );
+
+            fields.push(BodyFieldSpec {
+                name: name.clone(),
+                flag_name,
+                arg_id,
+                required: required.contains(name),
+                deprecated,
+                description,
+                schema,
+            });
+        }
+
+        Ok(fields)
+    }
+
+    fn object_schema(&self, value: &Value) -> Result<Option<Map<String, Value>>> {
+        let Some(obj) = value.as_object() else {
+            return Ok(None);
+        };
+        if obj.contains_key("properties") {
+            return Ok(Some(obj.clone()));
+        }
+
+        for key in ["anyOf", "oneOf", "allOf"] {
+            let Some(items) = obj.get(key).and_then(Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let resolved = self.resolve_value(item)?;
+                if let Value::Object(candidate) = resolved {
+                    if candidate.contains_key("properties") {
+                        return Ok(Some(candidate));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     fn resolve_value(&self, value: &Value) -> Result<Value> {
@@ -809,6 +983,21 @@ const RESERVED_ROOT_COMMANDS: &[&str] = &[
     "schema",
     "uninstall",
 ];
+
+fn schema_type_name(obj: &Map<String, Value>) -> Option<String> {
+    match obj.get("type") {
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(Value::Array(values)) => {
+            let parts = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join("|"))
+        }
+        _ => None,
+    }
+}
 
 fn infer_schema_type(obj: &Map<String, Value>) -> Option<String> {
     if obj.contains_key("properties") {
@@ -882,19 +1071,32 @@ fn derive_operation_name(method: &str, path: &str) -> String {
 }
 
 fn unique_slug(base: &str, used: &mut HashSet<String>) -> String {
-    let base_slug = slugify(base);
-    if used.insert(base_slug.clone()) {
-        return base_slug;
+    unique_name(slugify(base), used, '-')
+}
+
+fn unique_name(base: String, used: &mut HashSet<String>, separator: char) -> String {
+    if used.insert(base.clone()) {
+        return base;
     }
 
     let mut index = 2usize;
     loop {
-        let candidate = format!("{base_slug}-{index}");
+        let candidate = format!("{base}{separator}{index}");
         if used.insert(candidate.clone()) {
             return candidate;
         }
         index += 1;
     }
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
 }
 
 pub fn slugify(input: &str) -> String {
@@ -971,8 +1173,8 @@ fn value_to_string(value: &Value) -> String {
 mod tests {
     use super::*;
 
-        fn operation_id_openapi_json() -> &'static str {
-                r##"{
+    fn operation_id_openapi_json() -> &'static str {
+        r##"{
                     "openapi": "3.0.3",
                     "info": {"title": "x", "version": "1"},
                     "paths": {
@@ -988,7 +1190,7 @@ mod tests {
                         }
                     }
                 }"##
-        }
+    }
 
     #[test]
     fn slugify_is_stable() {
@@ -997,48 +1199,54 @@ mod tests {
         assert_eq!(slugify("GET /pets/{id}"), "get-pets-id");
     }
 
-        #[test]
-        fn applies_operation_name_overrides() {
-                let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
-                let overrides = BTreeMap::from([("listPets".to_string(), "pets list".to_string())]);
+    #[test]
+    fn applies_operation_name_overrides() {
+        let mut spec =
+            OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+        let overrides = BTreeMap::from([("listPets".to_string(), "pets list".to_string())]);
 
-                spec.apply_operation_name_overrides(&overrides).unwrap();
+        spec.apply_operation_name_overrides(&overrides).unwrap();
 
-                let operation = spec.find_operation("pets-list").expect("remapped op");
-                assert_eq!(operation.operation_id.as_deref(), Some("listPets"));
-                assert_eq!(operation.slug, "pets-list");
-                assert_eq!(spec.find_operation("listPets").unwrap().slug, "pets-list");
-        }
+        let operation = spec.find_operation("pets-list").expect("remapped op");
+        assert_eq!(operation.operation_id.as_deref(), Some("listPets"));
+        assert_eq!(operation.slug, "pets-list");
+        assert_eq!(spec.find_operation("listPets").unwrap().slug, "pets-list");
+    }
 
-        #[test]
-        fn rejects_unknown_operation_name_override() {
-                let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
-                let overrides = BTreeMap::from([("missingOperation".to_string(), "pets-list".to_string())]);
+    #[test]
+    fn rejects_unknown_operation_name_override() {
+        let mut spec =
+            OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+        let overrides = BTreeMap::from([("missingOperation".to_string(), "pets-list".to_string())]);
 
-                let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
+        let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
 
-                assert!(error.to_string().contains("unknown operationId"));
-        }
+        assert!(error.to_string().contains("unknown operationId"));
+    }
 
-        #[test]
-        fn rejects_reserved_operation_name_override() {
-                let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
-                let overrides = BTreeMap::from([("listPets".to_string(), "list".to_string())]);
+    #[test]
+    fn rejects_reserved_operation_name_override() {
+        let mut spec =
+            OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+        let overrides = BTreeMap::from([("listPets".to_string(), "list".to_string())]);
 
-                let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
+        let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
 
-                assert!(error.to_string().contains("reserved CLI command"));
-        }
+        assert!(error.to_string().contains("reserved CLI command"));
+    }
 
-        #[test]
-        fn rejects_operation_name_override_that_collides_with_existing_slug() {
-            let mut spec = OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
-            let overrides = BTreeMap::from([("listPets".to_string(), "create pet".to_string())]);
+    #[test]
+    fn rejects_operation_name_override_that_collides_with_existing_slug() {
+        let mut spec =
+            OpenApiSpec::from_json_with_source(operation_id_openapi_json(), None).unwrap();
+        let overrides = BTreeMap::from([("listPets".to_string(), "create pet".to_string())]);
 
-            let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
+        let error = spec.apply_operation_name_overrides(&overrides).unwrap_err();
 
-            assert!(error.to_string().contains("duplicate CLI command 'create-pet'"));
-        }
+        assert!(error
+            .to_string()
+            .contains("duplicate CLI command 'create-pet'"));
+    }
 
     #[test]
     fn resolves_local_parameter_refs() {
@@ -1070,5 +1278,80 @@ mod tests {
         assert_eq!(operation.parameters.len(), 1);
         assert_eq!(operation.parameters[0].name, "petId");
         assert_eq!(operation.parameters[0].location, "path");
+    }
+
+    #[test]
+    fn extracts_json_request_body_fields_from_component_schema() {
+        let json = r##"{
+          "openapi": "3.1.0",
+          "info": {"title": "x", "version": "1"},
+          "paths": {
+            "/exec": {
+              "post": {
+                "operationId": "exec",
+                "requestBody": {
+                  "required": true,
+                  "content": {
+                    "application/json": {
+                      "schema": {"$ref": "#/components/schemas/ExecRequest"}
+                    }
+                  }
+                },
+                "responses": {"200": {"description": "ok"}}
+              }
+            }
+          },
+          "components": {
+            "schemas": {
+              "ExecRequest": {
+                "type": "object",
+                "required": ["command"],
+                "properties": {
+                  "command": {"type": "array", "items": {"type": "string"}, "description": "Command argv"},
+                  "timeout": {"anyOf": [{"type": "integer"}, {"type": "null"}], "title": "Timeout"},
+                  "pty": {"type": "boolean", "default": false}
+                }
+              }
+            }
+          }
+        }"##;
+
+        let spec = OpenApiSpec::from_json_with_source(json, None).unwrap();
+        let operation = spec.find_operation("exec").unwrap();
+        let body = operation.request_body.as_ref().unwrap();
+
+        assert_eq!(body.fields.len(), 3);
+        let command = body
+            .fields
+            .iter()
+            .find(|field| field.name == "command")
+            .unwrap();
+        assert_eq!(command.flag_name, "body-command");
+        assert!(command.required);
+        assert_eq!(
+            command.schema.as_ref().unwrap().type_name.as_deref(),
+            Some("array")
+        );
+        assert_eq!(
+            command
+                .schema
+                .as_ref()
+                .unwrap()
+                .items
+                .as_ref()
+                .unwrap()
+                .type_name
+                .as_deref(),
+            Some("string")
+        );
+        let timeout = body
+            .fields
+            .iter()
+            .find(|field| field.name == "timeout")
+            .unwrap();
+        assert_eq!(
+            timeout.schema.as_ref().unwrap().type_name.as_deref(),
+            Some("integer|null")
+        );
     }
 }
